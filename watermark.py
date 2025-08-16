@@ -29,7 +29,7 @@ class WatermarkBot:
         self.bot_token = bot_token
         self.user_sessions = {}
         self.persistent_data = {}
-        self.admin_users = [2038923790]  # Admin user IDs
+        self.admin_users = [5838583307]  # Admin user IDs
 
         # Create directories for persistent storage including normalized intros cache
         for dir_name in [
@@ -3459,10 +3459,10 @@ Send me a video to start! 🎥
 
 
 if __name__ == "__main__":
-    API_ID = int(os.getenv("API_ID", "20176556"))
-    API_HASH = os.getenv("API_HASH", "8136bd26f62a889221fc6d25cebe4e6a")
+    API_ID = int(os.getenv("API_ID", "6063221"))
+    API_HASH = os.getenv("API_HASH", "8f9bebe9a9cb147ee58f70f46506f787")
     BOT_TOKEN = os.getenv("BOT_TOKEN",
-                          "8053835563:AAHa1a1WOMKBxZeAAjXOipIcv2zwCGy5AZI")
+                          "7219961311:AAHllFimFwhoMRIJSJy1OSQ_oviiGceK-m4")
 
     print("🤖 Starting enhanced watermark bot...")
     bot = WatermarkBot(API_ID, API_HASH, BOT_TOKEN)

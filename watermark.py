@@ -29,7 +29,7 @@ class WatermarkBot:
         self.bot_token = bot_token
         self.user_sessions = {}
         self.persistent_data = {}
-        self.admin_users = [5838583307]  # Admin user IDs
+        self.admin_users = [2038923790]  # Admin user IDs
 
         # Create directories for persistent storage including normalized intros cache
         for dir_name in [

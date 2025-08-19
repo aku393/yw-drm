@@ -3462,7 +3462,7 @@ if __name__ == "__main__":
     API_ID = int(os.getenv("API_ID", "6063221"))
     API_HASH = os.getenv("API_HASH", "8f9bebe9a9cb147ee58f70f46506f787")
     BOT_TOKEN = os.getenv("BOT_TOKEN",
-                          "7219961311:AAHllFimFwhoMRIJSJy1OSQ_oviiGceK-m4")
+                          "7219961311:AAEYxJ4aHzQsf2c6_dcQFyWskSkCeE-Sa4k")
 
     print("🤖 Starting enhanced watermark bot...")
     bot = WatermarkBot(API_ID, API_HASH, BOT_TOKEN)

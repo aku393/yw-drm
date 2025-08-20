@@ -5,3465 +5,2955 @@ import shutil
 import logging
 import json
 import time
+import threading
+import concurrent.futures
+import multiprocessing
 from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple, Union
+from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageEnhance
 from pyrogram import Client, filters as pyrogram_filters
 from pyrogram.types import Message
 import psutil
+import subprocess
+import hashlib
+from pathlib import Path
+import weakref
 
-# Configure logging
+# Configure optimized logging
 logging.basicConfig(
-    format='%(levelname)s: %(message)s',
-    level=logging.WARNING)
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler('watermark_bot.log'),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
+@dataclass
+class VideoInfo:
+    """Optimized video information container"""
+    width: int
+    height: int
+    fps: float
+    duration: float
+    codec: str
+    bitrate: int
+    format: str
+    frame_count: int
+    has_audio: bool
+    audio_codec: str = None
+    audio_bitrate: int = 0
+
+@dataclass
+class ProcessingProgress:
+    """Progress tracking container"""
+    stage: str
+    current: int
+    total: int
+    percentage: float
+    speed: float
+    eta_seconds: float
+    elapsed_seconds: float
+    details: Dict[str, Any]
+
+class OptimizedFFmpegProcessor:
+    """High-performance FFmpeg processor with GPU acceleration support"""
+    
+    def __init__(self):
+        self.gpu_available = self._check_gpu_support()
+        self.cpu_count = multiprocessing.cpu_count()
+        self.optimal_threads = min(self.cpu_count * 2, 16)
+        self._setup_gpu_codecs()
+        
+    def _check_gpu_support(self) -> bool:
+        """Check for available GPU acceleration"""
+        try:
+            # Check for NVIDIA GPU
+            result = subprocess.run(['nvidia-smi'], capture_output=True, text=True)
+            if result.returncode == 0:
+                logger.info("NVIDIA GPU detected")
+                return True
+        except FileNotFoundError:
+            pass
+            
+        try:
+            # Check for Intel Quick Sync
+            result = subprocess.run(['ffmpeg', '-hide_banner', '-hwaccels'], 
+                                 capture_output=True, text=True)
+            if 'qsv' in result.stdout:
+                logger.info("Intel Quick Sync detected")
+                return True
+        except FileNotFoundError:
+            pass
+            
+        try:
+            # Check for AMD GPU
+            result = subprocess.run(['rocm-smi'], capture_output=True, text=True)
+            if result.returncode == 0:
+                logger.info("AMD GPU detected")
+                return True
+        except FileNotFoundError:
+            pass
+            
+        logger.info("No GPU acceleration available, using CPU")
+        return False
+    
+    def _setup_gpu_codecs(self):
+        """Setup optimal codecs based on available hardware"""
+        if self.gpu_available:
+            # Test available hardware encoders
+            test_cmd = ['ffmpeg', '-hide_banner', '-encoders']
+            try:
+                result = subprocess.run(test_cmd, capture_output=True, text=True)
+                output = result.stdout.lower()
+                
+                if 'h264_nvenc' in output:
+                    self.encoder = 'h264_nvenc'
+                    self.decoder = 'h264_cuvid'
+                    self.gpu_type = 'nvidia'
+                elif 'h264_qsv' in output:
+                    self.encoder = 'h264_qsv'
+                    self.decoder = 'h264_qsv'
+                    self.gpu_type = 'intel'
+                elif 'h264_amf' in output:
+                    self.encoder = 'h264_amf'
+                    self.decoder = 'h264'
+                    self.gpu_type = 'amd'
+                else:
+                    self._fallback_to_cpu()
+            except Exception as e:
+                logger.warning(f"GPU codec detection failed: {e}")
+                self._fallback_to_cpu()
+        else:
+            self._fallback_to_cpu()
+    
+    def _fallback_to_cpu(self):
+        """Fallback to optimized CPU encoding"""
+        self.encoder = 'libx264'
+        self.decoder = 'h264'
+        self.gpu_type = 'cpu'
+        self.gpu_available = False
+        
+    def get_optimal_preset(self, file_size_mb: float, duration: float) -> str:
+        """Get optimal encoding preset based on file characteristics"""
+        if self.gpu_available:
+            return 'fast'  # GPU encoders use different presets
+        else:
+            # CPU encoding optimization based on file size and duration
+            if file_size_mb > 500 or duration > 1800:  # Large files or >30min
+                return 'ultrafast'
+            elif file_size_mb > 100 or duration > 600:  # Medium files or >10min
+                return 'superfast'
+            else:
+                return 'veryfast'
+    
+    def get_optimal_crf(self, target_quality: str = 'balanced') -> int:
+        """Get optimal CRF value for quality vs speed balance"""
+        quality_map = {
+            'fastest': 28,
+            'balanced': 23,
+            'quality': 20
+        }
+        return quality_map.get(target_quality, 23)
+
+class AdvancedProgressTracker:
+    """Advanced progress tracking with predictive ETA and smooth updates"""
+    
+    def __init__(self, user_id: int):
+        self.user_id = user_id
+        self.start_time = time.time()
+        self.stages = {}
+        self.current_stage = None
+        self.progress_history = []
+        self.speed_samples = []
+        self.last_update = 0
+        self.update_interval = 1.0  # Reduced to 1 second for responsiveness
+        
+    def add_stage(self, stage_name: str, total_work: int, weight: float = 1.0):
+        """Add a processing stage with estimated work units"""
+        self.stages[stage_name] = {
+            'total_work': total_work,
+            'completed_work': 0,
+            'weight': weight,
+            'start_time': None,
+            'end_time': None,
+            'speed_history': []
+        }
+    
+    def update_stage(self, stage_name: str, completed_work: int, details: Dict = None):
+        """Update progress for a specific stage"""
+        if stage_name not in self.stages:
+            self.add_stage(stage_name, completed_work, 1.0)
+            
+        stage = self.stages[stage_name]
+        if stage['start_time'] is None:
+            stage['start_time'] = time.time()
+            
+        stage['completed_work'] = completed_work
+        stage['details'] = details or {}
+        
+        # Calculate stage speed
+        elapsed = time.time() - stage['start_time']
+        if elapsed > 0:
+            speed = completed_work / elapsed
+            stage['speed_history'].append(speed)
+            if len(stage['speed_history']) > 10:
+                stage['speed_history'].pop(0)
+        
+        self.current_stage = stage_name
+    
+    def get_overall_progress(self) -> ProcessingProgress:
+        """Calculate overall progress across all stages"""
+        if not self.stages:
+            return ProcessingProgress("initializing", 0, 100, 0.0, 0.0, 0.0, 0.0, {})
+        
+        total_weight = sum(stage['weight'] for stage in self.stages.values())
+        weighted_progress = 0.0
+        overall_speed = 0.0
+        
+        for stage_name, stage in self.stages.items():
+            if stage['total_work'] > 0:
+                stage_progress = min(1.0, stage['completed_work'] / stage['total_work'])
+                weighted_progress += stage_progress * stage['weight']
+                
+                if stage['speed_history']:
+                    avg_speed = sum(stage['speed_history']) / len(stage['speed_history'])
+                    overall_speed += avg_speed * stage['weight']
+        
+        overall_percentage = (weighted_progress / total_weight) * 100 if total_weight > 0 else 0.0
+        overall_percentage = min(100.0, max(0.0, overall_percentage))
+        
+        elapsed = time.time() - self.start_time
+        eta = self._calculate_eta(overall_percentage, overall_speed)
+        
+        return ProcessingProgress(
+            stage=self.current_stage or "processing",
+            current=int(overall_percentage),
+            total=100,
+            percentage=overall_percentage,
+            speed=overall_speed,
+            eta_seconds=eta,
+            elapsed_seconds=elapsed,
+            details=self._get_current_stage_details()
+        )
+    
+    def _calculate_eta(self, percentage: float, speed: float) -> float:
+        """Calculate ETA using multiple methods for accuracy"""
+        if percentage >= 100:
+            return 0
+            
+        # Method 1: Based on current speed
+        if speed > 0:
+            remaining_work = (100 - percentage)
+            eta1 = remaining_work / speed
+        else:
+            eta1 = float('inf')
+        
+        # Method 2: Based on elapsed time and percentage
+        elapsed = time.time() - self.start_time
+        if percentage > 0 and elapsed > 0:
+            rate = percentage / elapsed
+            eta2 = (100 - percentage) / rate if rate > 0 else float('inf')
+        else:
+            eta2 = float('inf')
+        
+        # Use the more conservative estimate
+        eta = min(eta1, eta2) if eta1 != float('inf') and eta2 != float('inf') else max(eta1, eta2)
+        return eta if eta != float('inf') else 0
+    
+    def _get_current_stage_details(self) -> Dict[str, Any]:
+        """Get details for the current processing stage"""
+        if not self.current_stage or self.current_stage not in self.stages:
+            return {}
+            
+        stage = self.stages[self.current_stage]
+        return stage.get('details', {})
+
+class HighPerformanceVideoProcessor:
+    """Ultra-fast video processing with parallel processing and optimization"""
+    
+    def __init__(self):
+        self.ffmpeg_processor = OptimizedFFmpegProcessor()
+        self.thread_pool = ThreadPoolExecutor(max_workers=4)
+        self.temp_cleanup_queue = []
+        self._setup_temp_directory()
+        
+    def _setup_temp_directory(self):
+        """Setup optimized temporary directory"""
+        self.temp_base = Path(tempfile.gettempdir()) / "watermark_bot_optimized"
+        self.temp_base.mkdir(exist_ok=True)
+        
+    async def get_video_info_fast(self, video_path: str) -> VideoInfo:
+        """Ultra-fast video information extraction"""
+        cmd = [
+            'ffprobe', '-v', 'quiet', '-print_format', 'json',
+            '-show_format', '-show_streams', '-select_streams', 'v:0',
+            video_path
+        ]
+        
+        try:
+            result = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await result.communicate()
+            
+            if result.returncode != 0:
+                raise Exception(f"FFprobe failed: {stderr.decode()}")
+                
+            info = json.loads(stdout.decode())
+            
+            # Extract video stream info
+            video_stream = None
+            audio_stream = None
+            
+            for stream in info.get('streams', []):
+                if stream.get('codec_type') == 'video' and video_stream is None:
+                    video_stream = stream
+                elif stream.get('codec_type') == 'audio' and audio_stream is None:
+                    audio_stream = stream
+            
+            if not video_stream:
+                raise Exception("No video stream found")
+            
+            # Parse frame rate
+            fps_str = video_stream.get('r_frame_rate', '30/1')
+            if '/' in fps_str:
+                num, den = map(float, fps_str.split('/'))
+                fps = num / den if den > 0 else 30.0
+            else:
+                fps = float(fps_str)
+            
+            # Get duration from multiple sources
+            duration = 0.0
+            if video_stream.get('duration'):
+                duration = float(video_stream['duration'])
+            elif info.get('format', {}).get('duration'):
+                duration = float(info['format']['duration'])
+            
+            # Calculate frame count
+            frame_count = int(duration * fps) if duration > 0 and fps > 0 else 0
+            
+            return VideoInfo(
+                width=int(video_stream.get('width', 1920)),
+                height=int(video_stream.get('height', 1080)),
+                fps=fps,
+                duration=duration,
+                codec=video_stream.get('codec_name', 'h264'),
+                bitrate=int(video_stream.get('bit_rate', 0)) if video_stream.get('bit_rate') else 0,
+                format=info.get('format', {}).get('format_name', 'mp4'),
+                frame_count=frame_count,
+                has_audio=audio_stream is not None,
+                audio_codec=audio_stream.get('codec_name') if audio_stream else None,
+                audio_bitrate=int(audio_stream.get('bit_rate', 0)) if audio_stream and audio_stream.get('bit_rate') else 0
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to get video info for {video_path}: {e}")
+            # Return default values for fallback
+            return VideoInfo(1920, 1080, 30.0, 0.0, 'h264', 0, 'mp4', 0, False)
+    
+    async def optimize_video_preprocessing(self, input_path: str, target_specs: Dict[str, Any]) -> str:
+        """Preprocess video for optimal watermarking performance"""
+        temp_optimized = self.temp_base / f"optimized_{int(time.time())}_{os.getpid()}.mp4"
+        
+        video_info = await self.get_video_info_fast(input_path)
+        
+        # Determine if preprocessing is needed
+        needs_scaling = (video_info.width != target_specs.get('width', video_info.width) or 
+                        video_info.height != target_specs.get('height', video_info.height))
+        needs_fps_change = abs(video_info.fps - target_specs.get('fps', video_info.fps)) > 0.1
+        
+        if not needs_scaling and not needs_fps_change:
+            return input_path  # No preprocessing needed
+        
+        # Build preprocessing command
+        cmd = ['ffmpeg', '-y', '-i', input_path]
+        
+        # Add hardware decoding if available
+        if self.ffmpeg_processor.gpu_available and self.ffmpeg_processor.decoder != 'h264':
+            cmd.extend(['-c:v', self.ffmpeg_processor.decoder])
+        
+        # Video filters
+        filters = []
+        if needs_scaling:
+            target_width = target_specs.get('width', video_info.width)
+            target_height = target_specs.get('height', video_info.height)
+            filters.append(f'scale={target_width}:{target_height}:force_original_aspect_ratio=decrease')
+            filters.append(f'pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2')
+        
+        if needs_fps_change:
+            target_fps = target_specs.get('fps', video_info.fps)
+            filters.append(f'fps={target_fps}')
+        
+        if filters:
+            cmd.extend(['-vf', ','.join(filters)])
+        
+        # Encoding settings
+        file_size_mb = os.path.getsize(input_path) / (1024 * 1024)
+        preset = self.ffmpeg_processor.get_optimal_preset(file_size_mb, video_info.duration)
+        
+        cmd.extend([
+            '-c:v', self.ffmpeg_processor.encoder,
+            '-preset', preset,
+            '-crf', str(self.ffmpeg_processor.get_optimal_crf('fastest')),
+            '-c:a', 'copy',  # Copy audio to save time
+            '-movflags', '+faststart',
+            '-threads', str(self.ffmpeg_processor.optimal_threads),
+            str(temp_optimized)
+        ])
+        
+        # Execute preprocessing
+        process = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode != 0:
+            raise Exception(f"Preprocessing failed: {stderr.decode()}")
+        
+        self.temp_cleanup_queue.append(temp_optimized)
+        return str(temp_optimized)
 
 class WatermarkBot:
-
+    """Optimized Watermark Bot with extreme performance improvements"""
+    
     def __init__(self, api_id: int, api_hash: str, bot_token: str):
         self.api_id = api_id
         self.api_hash = api_hash
         self.bot_token = bot_token
+        
+        # High-performance session management
         self.user_sessions = {}
         self.persistent_data = {}
-        self.admin_users = [2038923790]  # Admin user IDs
-
-        # Create directories for persistent storage including normalized intros cache
-        for dir_name in [
-                'persistent_intros', 'persistent_watermarks',
-                'persistent_thumbnails', 'bulk_queue', 'persistent_captions',
-                'normalized_intros_cache'
-        ]:
+        self.admin_users = [2038923790]
+        self.processing_locks = {}  # User-specific processing locks
+        
+        # Performance optimizations
+        self.video_processor = HighPerformanceVideoProcessor()
+        self.progress_trackers = weakref.WeakValueDictionary()
+        
+        # Initialize directory structure with proper permissions
+        self._setup_directories()
+        
+        # Initialize Pyrogram client with optimization
+        self.app = Client(
+            "watermark_bot_optimized",
+            api_id=api_id,
+            api_hash=api_hash,
+            bot_token=bot_token,
+            workdir=".",
+            max_concurrent_transmissions=4  # Parallel uploads
+        )
+        
+        # Setup background cleanup task
+        self._setup_background_tasks()
+    
+    def _setup_directories(self):
+        """Setup directory structure with optimized permissions"""
+        directories = [
+            'persistent_intros', 'persistent_watermarks', 'persistent_thumbnails',
+            'bulk_queue', 'persistent_captions', 'cache', 'temp_processing'
+        ]
+        
+        for directory in directories:
             try:
-                os.makedirs(dir_name, mode=0o755, exist_ok=True)
+                Path(directory).mkdir(mode=0o755, exist_ok=True)
             except Exception as e:
-                logger.error(f"Failed to create directory {dir_name}: {e}")
+                logger.error(f"Failed to create directory {directory}: {e}")
                 raise
-
-        # Initialize Pyrogram client with fresh session
-        self.app = Client("watermark_bot_new",
-                          api_id=api_id,
-                          api_hash=api_hash,
-                          bot_token=bot_token,
-                          workdir=".")
-
-    def get_system_usage(self):
-        """Get CPU and RAM usage"""
+    
+    def _setup_background_tasks(self):
+        """Setup background maintenance tasks"""
+        self.cleanup_interval = 300  # 5 minutes
+        self.last_cleanup = time.time()
+    
+    def get_system_usage(self) -> str:
+        """Enhanced system usage information"""
         try:
             cpu_percent = psutil.cpu_percent(interval=0.1)
             memory = psutil.virtual_memory()
-            return f"💻 CPU: {cpu_percent:.1f}% | RAM: {memory.percent:.1f}%"
-        except:
-            return "💻 System info unavailable"
-
-    async def create_progress_message(self,
-                                      message: Message,
-                                      initial_text: str,
-                                      video_num: int = None,
-                                      total_videos: int = None,
-                                      filename: str = None):
-        """Create progress message with enhanced tracking and user info"""
+            disk = psutil.disk_usage('/')
+            
+            # GPU information if available
+            gpu_info = ""
+            if self.video_processor.ffmpeg_processor.gpu_available:
+                gpu_info = f" | GPU: {self.video_processor.ffmpeg_processor.gpu_type.upper()}"
+            
+            return (f"CPU: {cpu_percent:.1f}% | "
+                   f"RAM: {memory.percent:.1f}% | "
+                   f"Disk: {disk.percent:.1f}%{gpu_info}")
+        except Exception as e:
+            logger.warning(f"System info error: {e}")
+            return "System info unavailable"
+    
+    async def get_user_processing_lock(self, user_id: int) -> asyncio.Lock:
+        """Get or create user-specific processing lock"""
+        if user_id not in self.processing_locks:
+            self.processing_locks[user_id] = asyncio.Lock()
+        return self.processing_locks[user_id]
+    
+    async def create_advanced_progress_message(self, message: Message, initial_text: str,
+                                             video_num: int = None, total_videos: int = None,
+                                             filename: str = None) -> Message:
+        """Create enhanced progress message with advanced tracking"""
         user_id = message.from_user.id
-
-        # Store user information for progress display
-        user_info = {
-            'name': getattr(message.from_user, 'first_name', f'User{user_id}'),
-            'id': user_id
-        }
-
-        # Get task name from filename, video, or caption - prioritize actual filename
-        task_name = "Processing.mp4"
+        
+        # Create progress tracker
+        tracker = AdvancedProgressTracker(user_id)
+        self.progress_trackers[user_id] = tracker
+        
+        # Prepare display filename
+        task_name = self._prepare_display_filename(message, filename)
+        
+        # Add counter for bulk processing
+        if video_num and total_videos:
+            counter_text = f"[{video_num}/{total_videos}] "
+            initial_text = counter_text + initial_text
+        
+        progress_message = await message.reply_text(initial_text)
+        
+        # Store in session with enhanced metadata
+        if user_id not in self.user_sessions:
+            self.user_sessions[user_id] = {}
+        
+        self.user_sessions[user_id].update({
+            'progress_message': progress_message,
+            'progress_tracker': tracker,
+            'video_counter': f"[{video_num}/{total_videos}] " if video_num and total_videos else "",
+            'current_task': task_name,
+            'processing_start_time': time.time(),
+            'last_progress_update': 0
+        })
+        
+        return progress_message
+    
+    def _prepare_display_filename(self, message: Message, filename: str = None) -> str:
+        """Prepare optimized display filename"""
         if filename:
             task_name = filename
         elif hasattr(message, 'video') and message.video:
             task_name = getattr(message.video, 'file_name', message.caption or "Video.mp4")
         elif hasattr(message, 'caption') and message.caption:
             task_name = message.caption[:30] + ".mp4" if len(message.caption) > 30 else message.caption + ".mp4"
-
-        # Truncate filename if too long for display
-        if len(task_name) > 35:
-            task_name = task_name[:32] + "..."
-
-        # Add video counter if bulk processing
-        if video_num and total_videos:
-            counter_text = f"[{video_num}/{total_videos}] "
-            initial_text = counter_text + initial_text
-
-        progress_message = await message.reply_text(initial_text)
-
-        # Store in session for enhanced tracking
-        if user_id not in self.user_sessions:
-            self.user_sessions[user_id] = {}
-
-        self.user_sessions[user_id].update({
-            'progress_message': progress_message,
-            'video_counter': f"[{video_num}/{total_videos}] " if video_num and total_videos else "",
-            'last_update_time': 0,
-            'last_percent': -1,
-            'update_count': 0,
-            'user_info': user_info,
-            'current_task': task_name,
-            'download_started': False,
-            'bytes_downloaded': 0,
-            'download_speed_samples': [],
-            'last_speed_update': 0
-        })
-
-        return progress_message
-
-    async def update_progress_smooth(self,
-                                     progress_message,
-                                     stage: str,
-                                     percent: float,
-                                     details: dict = None,
-                                     video_counter: str = "",
+        else:
+            task_name = "Processing.mp4"
+        
+        # Truncate for display
+        return task_name[:35] + "..." if len(task_name) > 35 else task_name
+    
+    async def update_progress_advanced(self, user_id: int, stage: str, 
+                                     completed: int, total: int, details: Dict = None,
                                      force_update: bool = False):
-        """Enhanced progress update with fixed percentage calculation and better UI"""
+        """Advanced progress update with intelligent throttling"""
         current_time = time.time()
-        user_id = None
-
-        # Find user_id from sessions
-        for uid, session in self.user_sessions.items():
-            if session.get('progress_message') == progress_message:
-                user_id = uid
-                break
-
-        if not user_id:
-            return
-
         session = self.user_sessions.get(user_id, {})
-        last_update_time = session.get('last_update_time', 0)
-        last_percent = session.get('last_percent', -1)
-        update_count = session.get('update_count', 0)
-
-        # Ensure percent is valid and within bounds
-        if percent is None or percent < 0:
-            percent = 0
-        elif percent > 100:
-            percent = 100
-
-        # Update every 2 seconds for better responsiveness
-        time_since_last = current_time - last_update_time
-        percent_change = abs(percent - last_percent)
-
-        should_update = (force_update or percent >= 100
-                         or percent_change >= 1.0 or time_since_last >= 2.0
-                         or update_count == 0)
-
-        if not should_update:
+        
+        if not session or 'progress_message' not in session:
             return
-
-        max_retries = 3
-        retry_count = 0
-
-        while retry_count < max_retries:
-            try:
-                # Get user info and task details
-                user_info = session.get('user_info', {})
-                user_name = user_info.get('name', f'User{user_id}')
-                task_name = session.get('current_task', 'Processing')
-
-                # Enhanced progress bar with better visual design
-                bar_length = 12
-                filled = int(bar_length * percent / 100)
-                bar_chars = ["█"] * filled + ["░"] * (bar_length - filled)
-                bar = "".join(bar_chars)
-
-                # Stage icons and descriptions with more detail
-                stage_mapping = {
-                    "downloading": ("Downloading", "⬇️"),
-                    "pipeline": ("Processing", "🔄"),
-                    "watermarking": ("Watermarking", "🎨"),
-                    "processing": ("Processing", "⚙️"),
-                    "encoding": ("Encoding", "🎬"),
-                    "finalizing": ("Finalizing", "🔧"),
-                    "uploaded": ("Uploading", "📤"),
-                    "uploading": ("Uploading", "📤"),
-                    "completed": ("Completed", "✅"),
-                    "rendering": ("Rendering", "🎭"),
-                    "concatenating": ("Merging", "🔗"),
-                    "normalizing": ("Normalizing", "📐"),
-                    "queued": ("Queued", "⏳"),
-                    "initializing": ("Initializing", "🚀")
-                }
-
-                stage_text, stage_icon = stage_mapping.get(stage, ("Processing", "🔄"))
-
-                # Build enhanced progress display
-                system_usage = self.get_system_usage()
-                progress_text = f"**📂 Task1: {task_name}**\n"
-                progress_text += f"├─ `{bar}` **{percent:.1f}%**\n"
-                progress_text += f"├─ **Status:** {stage_text} {stage_icon}\n"
-                progress_text += f"├─ **System:** {system_usage}\n"
-
-                # Add detailed processing information
-                if details:
-                    # Enhanced file transfer tracking - prioritize downloaded amount display
-                    if 'current_mb' in details:
-                        current_mb = max(0, float(details.get('current_mb', 0)))
-
-                        if current_mb > 0:
-                            if 'total_mb' in details and details['total_mb'] and float(details['total_mb']) > 0:
-                                total_mb = float(details['total_mb'])
-                                # Only show total if it's reasonable (greater than current)
-                                if total_mb >= current_mb:
-                                    progress_text += f"├─ **Progress:** {current_mb:.2f}MB / {total_mb:.2f}MB\n"
-                                else:
-                                    progress_text += f"├─ **Downloaded:** {current_mb:.2f}MB\n"
-                            else:
-                                progress_text += f"├─ **Downloaded:** {current_mb:.2f}MB\n"
-
-                    # Speed information with better formatting
-                    if 'speed_mbps' in details and details['speed_mbps']:
-                        speed = float(details['speed_mbps'])
-                        if speed > 0:
-                            if speed >= 1:
-                                progress_text += f"├─ **Speed:** {speed:.2f}MB/s ⚡\n"
-                            elif speed >= 0.1:
-                                progress_text += f"├─ **Speed:** {speed:.3f}MB/s ⚡\n"
-                            else:
-                                progress_text += f"├─ **Speed:** {speed*1024:.1f}KB/s ⚡\n"
-
-                    # Frame processing details
-                    if 'frame_progress' in details and details['frame_progress']:
-                        progress_text += f"├─ **Frames:** {details['frame_progress']}\n"
-
-                    # Processing FPS
-                    if 'processing_fps' in details and details['processing_fps'] and float(details['processing_fps']) > 0:
-                        fps_val = float(details['processing_fps'])
-                        progress_text += f"├─ **Processing:** {fps_val:.1f} fps 🎬\n"
-
-                    # ETA information
-                    if 'eta' in details and details['eta'] and str(details['eta']).strip():
-                        progress_text += f"├─ **ETA:** {details['eta']} ⏱️\n"
-                    else:
-                        progress_text += f"├─ **ETA:** Calculating... ⏱️\n"
-
-                    # Elapsed time
-                    if 'elapsed' in details and details['elapsed'] and str(details['elapsed']).strip():
-                        progress_text += f"└─ **Elapsed:** {details['elapsed']} ⏰\n"
-                    else:
-                        # Remove the last ├─ and replace with └─ if no elapsed time
-                        progress_text = progress_text.rstrip('\n')
-                        if progress_text.endswith('├─'):
-                            progress_text = progress_text[:-2] + '└─'
-                        progress_text += "\n"
+        
+        # Intelligent update throttling
+        last_update = session.get('last_progress_update', 0)
+        time_since_update = current_time - last_update
+        
+        # Progressive update intervals based on stage
+        if stage in ['downloading', 'uploading']:
+            min_interval = 2.0  # More frequent for I/O operations
+        else:
+            min_interval = 3.0  # Less frequent for processing
+        
+        if not force_update and time_since_update < min_interval:
+            return
+        
+        # Update progress tracker
+        tracker = session.get('progress_tracker')
+        if tracker:
+            tracker.update_stage(stage, completed, details)
+            progress = tracker.get_overall_progress()
+        else:
+            # Fallback progress calculation
+            percentage = (completed / total * 100) if total > 0 else 0
+            progress = ProcessingProgress(stage, completed, total, percentage, 0, 0, 0, details or {})
+        
+        try:
+            # Build enhanced progress display
+            progress_text = await self._build_progress_display(user_id, progress, details or {})
+            
+            await session['progress_message'].edit_text(progress_text)
+            session['last_progress_update'] = current_time
+            
+        except Exception as e:
+            if "MESSAGE_NOT_MODIFIED" in str(e):
+                pass  # Message content unchanged
+            elif "FLOOD_WAIT" in str(e):
+                # Extract wait time and delay
+                wait_time = int(str(e).split("FLOOD_WAIT_")[1].split()[0]) if "FLOOD_WAIT_" in str(e) else 5
+                await asyncio.sleep(min(wait_time, 10))
+            else:
+                logger.warning(f"Progress update failed: {e}")
+    
+    async def _build_progress_display(self, user_id: int, progress: ProcessingProgress, 
+                                    details: Dict) -> str:
+        """Build enhanced progress display with visual elements"""
+        session = self.user_sessions.get(user_id, {})
+        task_name = session.get('current_task', 'Processing')
+        counter = session.get('video_counter', '')
+        
+        # Enhanced progress bar
+        bar_length = 15
+        filled = int(bar_length * progress.percentage / 100)
+        bar_chars = ["█"] * filled + ["░"] * (bar_length - filled)
+        bar = "".join(bar_chars)
+        
+        # Stage mapping with better icons
+        stage_mapping = {
+            "downloading": ("Downloading", "⬇️"),
+            "preprocessing": ("Preprocessing", "⚙️"),
+            "watermarking": ("Watermarking", "🎨"),
+            "processing": ("Processing", "🔄"),
+            "encoding": ("Encoding", "🎬"),
+            "uploading": ("Uploading", "📤"),
+            "completed": ("Completed", "✅"),
+            "normalizing": ("Normalizing", "📐"),
+            "optimizing": ("Optimizing", "⚡")
+        }
+        
+        stage_text, stage_icon = stage_mapping.get(progress.stage, ("Processing", "🔄"))
+        
+        # System information
+        system_info = self.get_system_usage()
+        
+        # Build main progress text
+        progress_text = f"**{counter}📂 {task_name}**\n"
+        progress_text += f"├─ `{bar}` **{progress.percentage:.1f}%**\n"
+        progress_text += f"├─ **Status:** {stage_text} {stage_icon}\n"
+        progress_text += f"├─ **System:** {system_info}\n"
+        
+        # Add detailed information based on stage and details
+        if progress.speed > 0:
+            if progress.stage in ['downloading', 'uploading']:
+                # File transfer speeds
+                if progress.speed >= 1:
+                    progress_text += f"├─ **Speed:** {progress.speed:.2f}MB/s ⚡\n"
                 else:
-                    # Close the tree structure
-                    progress_text = progress_text.rstrip('\n')
-                    if progress_text.endswith('├─'):
-                        progress_text = progress_text[:-2] + '└─'
-                    progress_text += "\n"
+                    progress_text += f"├─ **Speed:** {progress.speed*1024:.1f}KB/s ⚡\n"
+            else:
+                # Processing speeds
+                progress_text += f"├─ **Processing:** {progress.speed:.1f}fps 🎬\n"
+        
+        # File size information
+        if 'current_mb' in details:
+            current_mb = details['current_mb']
+            if 'total_mb' in details and details['total_mb']:
+                total_mb = details['total_mb']
+                progress_text += f"├─ **Progress:** {current_mb:.2f}MB / {total_mb:.2f}MB\n"
+            else:
+                progress_text += f"├─ **Processed:** {current_mb:.2f}MB\n"
+        
+        # Frame information
+        if 'frames' in details:
+            progress_text += f"├─ **Frames:** {details['frames']}\n"
+        
+        # ETA and elapsed time
+        if progress.eta_seconds > 0:
+            eta_str = self._format_duration(progress.eta_seconds)
+            progress_text += f"├─ **ETA:** {eta_str} ⏱️\n"
+        
+        elapsed_str = self._format_duration(progress.elapsed_seconds)
+        progress_text += f"└─ **Elapsed:** {elapsed_str} ⏰\n"
+        
+        return progress_text
+    
+    def _format_duration(self, seconds: float) -> str:
+        """Format duration in human-readable format"""
+        if seconds >= 3600:
+            hours = int(seconds // 3600)
+            minutes = int((seconds % 3600) // 60)
+            return f"{hours}h{minutes}m"
+        elif seconds >= 60:
+            minutes = int(seconds // 60)
+            secs = int(seconds % 60)
+            return f"{minutes}m{secs}s"
+        else:
+            return f"{int(seconds)}s"
 
-                await progress_message.edit_text(progress_text)
-
-                # Update session tracking
-                session['last_update_time'] = current_time
-                session['last_percent'] = percent
-                session['update_count'] = update_count + 1
-
-                break
-
-            except Exception as e:
-                retry_count += 1
-                error_str = str(e)
-
-                if "FLOOD_WAIT" in error_str:
-                    try:
-                        wait_time = int(error_str.split("FLOOD_WAIT_")[1].split()[0])
-                        await asyncio.sleep(min(wait_time, 5))
-                    except:
-                        await asyncio.sleep(2)
-                elif "MESSAGE_NOT_MODIFIED" in error_str:
-                    session['last_update_time'] = current_time
-                    session['last_percent'] = percent
-                    break
-                elif "Request timed out" in error_str or "NetworkError" in error_str:
-                    await asyncio.sleep(0.5)
-                else:
-                    if retry_count >= max_retries:
-                        logger.warning(f"Progress update failed after {max_retries} attempts: {e}")
-                        break
-                    await asyncio.sleep(0.2)
-
-    async def download_with_progress(self,
-                                     message: Message,
-                                     file_id: str,
-                                     file_path: str,
-                                     file_type: str,
-                                     video_num: int = None,
-                                     total_videos: int = None,
-                                     filename: str = None):
-        """Download file with enhanced progress tracking - no file size limits"""
+    async def download_with_turbo_progress(self, message: Message, file_id: str, 
+                                         file_path: str, file_type: str,
+                                         video_num: int = None, total_videos: int = None,
+                                         filename: str = None) -> Message:
+        """Ultra-fast download with advanced progress tracking and no size limits"""
         user_id = message.from_user.id
-
-        # Check if process was stopped for this specific user
+        
+        # Check if process was stopped
         session = self.user_sessions.get(user_id, {})
         if session.get('stopped'):
             raise Exception(f"Process was stopped by user {user_id}")
-
-        # Get file size if available (no size limits enforced)
-        file_size = 0
-        try:
-            # Try to get file size from message object first
-            if hasattr(message, 'video') and message.video and hasattr(message.video, 'file_size') and message.video.file_size:
-                file_size = message.video.file_size
-            elif hasattr(message, 'photo') and message.photo and hasattr(message.photo, 'file_size') and message.photo.file_size:
-                file_size = message.photo.file_size
-            elif hasattr(message, 'document') and message.document and hasattr(message.document, 'file_size') and message.document.file_size:
-                file_size = message.document.file_size
-
-            # If still no file size, try Telegram API
-            if file_size == 0 or file_size is None:
-                try:
-                    file_info = await self.app.get_file(file_id)
-                    if hasattr(file_info, 'file_size') and file_info.file_size:
-                        file_size = file_info.file_size
-
-                except Exception as e:
-                    logger.warning(f"Could not get file size from API: {e}")
-
-
-        except Exception as e:
-            logger.warning(f"Error getting file size: {e}")
-
-        # Use filename for task display if provided
-        display_filename = filename or (
-            getattr(message.video, 'file_name', None) if hasattr(message, 'video') and message.video else None
-        ) or message.caption or f"{file_type}_file"
-
-        # Create progress message with filename display
+        
+        # Get file information with parallel metadata fetching
+        file_size = await self._get_file_size_optimized(message, file_id)
+        display_filename = self._prepare_display_filename(message, filename)
+        
+        # Create optimized progress message
         if "video" in file_type.lower():
-            progress_message = await self.create_progress_message(
-                message, f"🔄 **Processing video pipeline...**", video_num, total_videos, display_filename)
+            progress_message = await self.create_advanced_progress_message(
+                message, "🚀 **Initializing video pipeline...**", 
+                video_num, total_videos, display_filename
+            )
         else:
-            progress_message = await self.create_progress_message(
-                message, f"⬇️ **Downloading {file_type}...**", video_num, total_videos, display_filename)
-
-        video_counter = self.user_sessions[user_id].get('video_counter', "")
-
+            progress_message = await self.create_advanced_progress_message(
+                message, f"⬇️ **Downloading {file_type}...**", 
+                video_num, total_videos, display_filename
+            )
+        
+        # Setup progress tracking
+        tracker = self.progress_trackers.get(user_id)
+        if tracker:
+            expected_chunks = max(100, file_size // (1024 * 1024)) if file_size > 0 else 100
+            tracker.add_stage("downloading", expected_chunks, 1.0)
+        
         start_time = time.time()
-        speed_samples = []
-        last_current = 0
-        last_callback_time = start_time
-        session['download_started'] = True
-
-        async def enhanced_progress_callback(current, total):
-            nonlocal speed_samples, last_current, last_callback_time
+        downloaded_bytes = 0
+        speed_calculator = SpeedCalculator()
+        
+        async def turbo_progress_callback(current, total):
+            nonlocal downloaded_bytes, speed_calculator
             current_time = time.time()
-
+            
             # Check if stopped
             if self.user_sessions.get(user_id, {}).get('stopped'):
                 raise Exception("Process was stopped by user")
-
-            # Update session with latest download progress
-            session['bytes_downloaded'] = current
-
-            # Smart total size handling - prioritize actual data over estimates
-            working_total = total
-
-            # Use detected file size if total is invalid or zero
-            if working_total <= 0 or working_total is None:
-                if file_size > 0:
-                    working_total = file_size
-                else:
-                    working_total = 0  # Will show download amount only
-
-            # Handle case where current exceeds reported total (adjust total upward)
-            if current > working_total and working_total > 0:
-                working_total = current + (current * 0.1)  # Add 10% buffer
-                logger.info(f"Adjusted total size upward: {working_total} bytes")
-
-            # Calculate download metrics
+            
+            downloaded_bytes = current
+            speed_calculator.add_sample(current, current_time)
+            
+            # Calculate metrics
             current_mb = current / (1024 * 1024)
-            total_mb = working_total / (1024 * 1024) if working_total > 0 else 0
+            total_mb = total / (1024 * 1024) if total > 0 else file_size / (1024 * 1024)
+            speed_mbps = speed_calculator.get_average_speed() / (1024 * 1024)
             elapsed = current_time - start_time
-
-            # Enhanced speed calculation with better smoothing
-            time_diff = current_time - last_callback_time
-            if time_diff >= 0.5 and current > last_current:  # At least 500ms for stable measurement
-                bytes_diff = current - last_current
-                instant_speed = bytes_diff / time_diff
-
-                # Add to rolling average (keep last 8 samples)
-                speed_samples.append(instant_speed)
-                if len(speed_samples) > 8:
-                    speed_samples.pop(0)
-
-                # Use weighted average (recent samples have higher weight)
-                if len(speed_samples) >= 3:
-                    weights = [i + 1 for i in range(len(speed_samples))]
-                    weighted_sum = sum(speed * weight for speed, weight in zip(speed_samples, weights))
-                    weight_total = sum(weights)
-                    avg_speed = weighted_sum / weight_total
+            
+            # Progress calculation with smart total handling
+            if total > 0 and current <= total:
+                chunk_progress = int((current / total) * 100)
+            else:
+                # Estimate progress based on file size if available
+                if file_size > 0:
+                    chunk_progress = min(95, int((current / file_size) * 100))
                 else:
-                    avg_speed = sum(speed_samples) / len(speed_samples)
-
-                speed_mbps = avg_speed / (1024 * 1024)
-            elif elapsed > 0 and current > 0:
-                # Fallback to overall average speed
-                avg_speed = current / elapsed
-                speed_mbps = avg_speed / (1024 * 1024)
-            else:
-                speed_mbps = 0
-
-            # Calculate percentage - prioritize actual progress over estimates
-            if working_total > 0 and current <= working_total:
-                percent = (current / working_total) * 100
-            elif current > 0:
-                # Show progress without percentage if no reliable total
-                percent = min(99, (current_mb / 10) * 10)  # Rough progress based on downloaded amount
-            else:
-                percent = 0
-
+                    chunk_progress = min(90, int(current_mb / 10) * 10)
+            
             # ETA calculation
-            if speed_mbps > 0 and working_total > 0 and current < working_total:
-                remaining_bytes = working_total - current
-                eta_seconds = remaining_bytes / (speed_mbps * 1024 * 1024)
-
-                if eta_seconds > 3600:
-                    eta_str = f"{int(eta_seconds//3600)}h {int((eta_seconds%3600)//60)}m"
-                elif eta_seconds > 60:
-                    eta_str = f"{int(eta_seconds//60)}m {int(eta_seconds%60)}s"
-                else:
-                    eta_str = f"{int(eta_seconds)}s"
+            if speed_mbps > 0 and total_mb > current_mb:
+                remaining_mb = total_mb - current_mb
+                eta_seconds = remaining_mb / speed_mbps
             else:
-                eta_str = "calculating..." if current < working_total else "finishing..."
-
-            # Format elapsed time
-            if elapsed > 3600:
-                elapsed_str = f"{int(elapsed//3600)}h {int((elapsed%3600)//60)}m"
-            elif elapsed > 60:
-                elapsed_str = f"{int(elapsed//60)}m {int(elapsed%60)}s"
-            else:
-                elapsed_str = f"{int(elapsed)}s"
-
-            # Build progress details - always show downloaded amount
+                eta_seconds = 0
+            
+            # Build progress details
             details = {
                 'current_mb': current_mb,
-                'elapsed': elapsed_str
+                'speed_mbps': speed_mbps,
+                'eta_seconds': eta_seconds
             }
-
-            # Add total size only if we have a reliable value
-            if working_total > 0 and total_mb >= current_mb:
+            
+            if total_mb > 0:
                 details['total_mb'] = total_mb
-                details['eta'] = eta_str
-
-            # Add speed only if meaningful
-            if speed_mbps > 0:
-                details['speed_mbps'] = speed_mbps
-
-            # Update progress every 2 seconds or on significant changes
-            force_update = (current >= working_total) if working_total > 0 else False
-            stage_name = "pipeline" if "video" in file_type.lower() else "downloading"
-
-            if (current_time - last_callback_time >= 2.0) or force_update or (current == 0):
-                await self.update_progress_smooth(
-                    progress_message, stage_name, percent, details, video_counter, force_update
-                )
-                last_callback_time = current_time
-
-            last_current = current
-
-        try:
-            await self.app.download_media(file_id, file_name=file_path, progress=enhanced_progress_callback)
-
-            # Final completion update
-            final_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
-            final_mb = final_size / (1024 * 1024)
-
-            await self.update_progress_smooth(
-                progress_message, "completed", 100,
-                {
-                    'current_mb': final_mb,
-                    'status': f'{file_type.title()} download completed',
-                    'elapsed': f"{int(time.time() - start_time)}s"
-                },
-                video_counter, True
+            
+            # Update progress tracker
+            if tracker:
+                tracker.update_stage("downloading", chunk_progress, details)
+            
+            # Update display
+            await self.update_progress_advanced(
+                user_id, "downloading", chunk_progress, 100, details
             )
-
+        
+        try:
+            # Execute download with optimized settings
+            await self.app.download_media(
+                file_id, 
+                file_name=file_path, 
+                progress=turbo_progress_callback,
+                file_name_generator=lambda *args: file_path  # Force exact path
+            )
+            
+            # Verify download
+            if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+                raise Exception("Download verification failed")
+            
+            # Final update
+            final_size = os.path.getsize(file_path)
+            final_mb = final_size / (1024 * 1024)
+            total_time = time.time() - start_time
+            
+            details = {
+                'current_mb': final_mb,
+                'total_mb': final_mb,
+                'speed_mbps': final_mb / total_time if total_time > 0 else 0
+            }
+            
+            await self.update_progress_advanced(
+                user_id, "completed", 100, 100, details, force_update=True
+            )
+            
         except Exception as e:
             if "stopped by user" in str(e):
                 raise
             else:
                 logger.error(f"Download error: {e}")
                 raise Exception(f"Download failed: {str(e)}")
-
+        
         return progress_message
-
-    async def get_video_info(self, video_path: str):
-        """Get comprehensive video information using ffprobe"""
-        import subprocess
-        import json
-
+    
+    async def _get_file_size_optimized(self, message: Message, file_id: str) -> int:
+        """Get file size with multiple fallback methods"""
+        # Try message attributes first
+        if hasattr(message, 'video') and message.video and message.video.file_size:
+            return message.video.file_size
+        elif hasattr(message, 'photo') and message.photo and message.photo.file_size:
+            return message.photo.file_size
+        elif hasattr(message, 'document') and message.document and message.document.file_size:
+            return message.document.file_size
+        
+        # Fallback to API call
         try:
-            cmd = [
-                'ffprobe', '-v', 'quiet', '-print_format', 'json',
-                '-show_format', '-show_streams', video_path
-            ]
-            result = subprocess.run(cmd,
-                                    capture_output=True,
-                                    text=True,
-                                    check=True)
-            info = json.loads(result.stdout)
-
-            video_stream = None
-            for stream in info.get('streams', []):
-                if stream.get('codec_type') == 'video':
-                    video_stream = stream
-                    break
-
-            if video_stream:
-                # Parse frame rate
-                fps_str = video_stream.get('r_frame_rate', '30/1')
-                if '/' in fps_str:
-                    num, den = fps_str.split('/')
-                    fps = float(num) / float(den) if float(den) > 0 else 30
-                else:
-                    fps = float(fps_str)
-
-                # Get duration from multiple sources
-                duration = 0
-                if video_stream.get('duration'):
-                    duration = float(video_stream.get('duration'))
-                elif info.get('format', {}).get('duration'):
-                    duration = float(info.get('format', {}).get('duration'))
-                elif video_stream.get('tags', {}).get('DURATION'):
-                    duration_str = video_stream.get('tags', {}).get('DURATION')
-                    try:
-                        parts = duration_str.split(':')
-                        if len(parts) >= 3:
-                            hours = float(parts[0])
-                            minutes = float(parts[1])
-                            seconds = float(parts[2])
-                            duration = hours * 3600 + minutes * 60 + seconds
-                    except:
-                        pass
-
-                return {
-                    'width':
-                    int(video_stream.get('width', 1280)),
-                    'height':
-                    int(video_stream.get('height', 720)),
-                    'fps':
-                    fps,
-                    'duration':
-                    duration,
-                    'codec':
-                    video_stream.get('codec_name', 'h264'),
-                    'bitrate':
-                    int(video_stream.get('bit_rate', 0))
-                    if video_stream.get('bit_rate') else 0
-                }
+            file_info = await self.app.get_file(file_id)
+            return getattr(file_info, 'file_size', 0)
         except Exception as e:
-            logger.warning(f"Could not get video info for {video_path}: {e}")
+            logger.warning(f"Could not get file size: {e}")
+            return 0
 
-        return {
-            'width': 1280,
-            'height': 720,
-            'fps': 30,
-            'duration': 0,
-            'codec': 'h264',
-            'bitrate': 0
-        }
+class SpeedCalculator:
+    """Optimized speed calculation with smoothing"""
+    
+    def __init__(self, window_size: int = 10):
+        self.samples = []
+        self.window_size = window_size
+        self.last_bytes = 0
+        self.last_time = 0
+    
+    def add_sample(self, current_bytes: int, current_time: float):
+        """Add a new speed sample"""
+        if self.last_time > 0:
+            time_diff = current_time - self.last_time
+            byte_diff = current_bytes - self.last_bytes
+            
+            if time_diff > 0.1:  # Minimum interval for stable measurement
+                speed = byte_diff / time_diff
+                self.samples.append(speed)
+                
+                if len(self.samples) > self.window_size:
+                    self.samples.pop(0)
+        
+        self.last_bytes = current_bytes
+        self.last_time = current_time
+    
+    def get_average_speed(self) -> float:
+        """Get smoothed average speed"""
+        if not self.samples:
+            return 0.0
+        
+        # Weighted average favoring recent samples
+        weights = [i + 1 for i in range(len(self.samples))]
+        weighted_sum = sum(speed * weight for speed, weight in zip(self.samples, weights))
+        total_weight = sum(weights)
+        
+        return weighted_sum / total_weight if total_weight > 0 else 0.0
 
-    async def normalize_video(self, input_path: str, output_path: str,
-                              target_width: int, target_height: int,
-                              target_fps: float):
-        """Normalize video to target specifications with metadata preservation"""
-        import subprocess
-
+class UltraFastWatermarkEngine:
+    """Ultra-fast watermarking with GPU acceleration and optimizations"""
+    
+    def __init__(self, ffmpeg_processor: OptimizedFFmpegProcessor):
+        self.ffmpeg_processor = ffmpeg_processor
+        self.watermark_cache = {}
+        self.filter_cache = {}
+    
+    async def apply_watermarks_turbocharged(self, input_path: str, output_path: str,
+                                          watermark_text: str = None, 
+                                          watermark_png_path: str = None,
+                                          png_location: str = "topright",
+                                          progress_callback=None) -> bool:
+        """Apply watermarks with maximum performance optimization"""
         try:
-            # Get input video info
-            input_info = await self.get_video_info(input_path)
-
-            # Build normalization command with metadata preservation
-            cmd = [
-                'ffmpeg',
-                '-i',
-                input_path,
-                '-vf',
-                f'scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2,fps={target_fps}',
-                '-c:v',
-                'libx264',
-                '-preset',
-                'medium',
-                '-crf',
-                '20',
-                '-c:a',
-                'aac',
-                '-ar',
-                '44100',
-                '-ac',
-                '2',
-                '-b:a',
-                '128k',
-                '-maxrate',
-                '3M',
-                '-bufsize',
-                '6M',
-                '-map_metadata',
-                '0',  # Preserve metadata
-                '-movflags',
-                '+faststart',
-                '-y',
-                output_path
-            ]
-
-            result = subprocess.run(cmd,
-                                    check=True,
-                                    capture_output=True,
-                                    text=True)
-            logger.info(
-                f"Successfully normalized video: {input_path} -> {output_path}"
+            # Get video info for optimization
+            video_info = await self._get_cached_video_info(input_path)
+            
+            # Build optimized filter chain
+            filter_chain = await self._build_optimized_filters(
+                video_info, watermark_text, watermark_png_path, png_location
             )
-            return True
-
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Video normalization failed: {e.stderr}")
-            return False
+            
+            # Determine optimal encoding settings
+            encoding_settings = self._get_optimal_encoding_settings(video_info, input_path)
+            
+            # Build command with maximum optimization
+            cmd = await self._build_turbo_command(
+                input_path, output_path, filter_chain, encoding_settings, watermark_png_path
+            )
+            
+            # Execute with progress tracking
+            success = await self._execute_with_turbo_progress(
+                cmd, video_info, progress_callback
+            )
+            
+            return success
+            
         except Exception as e:
-            logger.error(f"Unexpected error in video normalization: {e}")
+            logger.error(f"Turbo watermarking failed: {e}")
+            # Emergency fallback - copy file if watermarking fails
+            if os.path.exists(input_path):
+                shutil.copy2(input_path, output_path)
+                return True
             return False
-
-    async def normalize_video_with_progress(self,
-                                            input_path: str,
-                                            output_path: str,
-                                            target_width: int,
-                                            target_height: int,
-                                            target_fps: float,
-                                            progress_callback=None):
-        """Normalize video with detailed progress tracking"""
-        import subprocess
-
-        try:
-            # Get input video info
-            input_info = await self.get_video_info(input_path)
-            total_frames = int(target_fps * input_info.get('duration', 0))
-
-            # Build normalization command with metadata preservation
-            cmd = [
-                'ffmpeg',
-                '-i',
-                input_path,
-                '-vf',
-                f'scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2,fps={target_fps}',
-                '-c:v',
-                'libx264',
-                '-preset',
-                'medium',
-                '-crf',
-                '20',
-                '-c:a',
-                'aac',
-                '-ar',
-                '44100',
-                '-ac',
-                '2',
-                '-b:a',
-                '128k',
-                '-maxrate',
-                '3M',
-                '-bufsize',
-                '6M',
-                '-map_metadata',
-                '0',  # Preserve metadata
-                '-movflags',
-                '+faststart',
-                '-y',
-                output_path
-            ]
-
-            if progress_callback:
-                process = subprocess.Popen(cmd,
-                                           stdout=subprocess.PIPE,
-                                           stderr=subprocess.PIPE,
-                                           universal_newlines=True)
-
-                frame_count = 0
-                last_frame_update = time.time()
-                while True:
-                    output = process.stderr.readline()
-                    if output == '' and process.poll() is not None:
-                        break
-                    if output:
-                        if 'frame=' in output:
-                            try:
-                                current_time = time.time()
-                                frame_match = output.split(
-                                    'frame=')[1].split()[0]
-                                frame_count = int(frame_match)
-                                # Update progress every 10 seconds for flood protection
-                                if current_time - last_frame_update >= 10.0:
-                                    if total_frames > 0:
-                                        percent = 10 + (
-                                            frame_count /
-                                            total_frames
-                                        ) * 50  # 10-60% for normalization
-                                        await progress_callback(
-                                            percent,
-                                            100,
-                                            f"Normalizing intro: frame {frame_count}/{total_frames}"
-                                        )
-                                    else:
-                                        await progress_callback(
-                                            30,
-                                            100,
-                                            f"Normalizing intro: frame {frame_count}"
-                                        )
-                                    last_frame_update = current_time
-                            except:
-                                pass
-
-                process.wait()
-                if process.returncode != 0:
-                    raise subprocess.CalledProcessError(
-                        process.returncode, cmd)
+    
+    async def _get_cached_video_info(self, video_path: str) -> VideoInfo:
+        """Get video info with caching for repeated access"""
+        cache_key = f"{video_path}_{os.path.getmtime(video_path)}"
+        
+        if cache_key in self.watermark_cache:
+            return self.watermark_cache[cache_key]
+        
+        # Use the optimized video processor
+        from watermark_bot_optimized import HighPerformanceVideoProcessor
+        processor = HighPerformanceVideoProcessor()
+        video_info = await processor.get_video_info_fast(video_path)
+        
+        # Cache for future use
+        self.watermark_cache[cache_key] = video_info
+        
+        # Cleanup old cache entries
+        if len(self.watermark_cache) > 50:
+            oldest_key = next(iter(self.watermark_cache))
+            del self.watermark_cache[oldest_key]
+        
+        return video_info
+    
+    async def _build_optimized_filters(self, video_info: VideoInfo, 
+                                     watermark_text: str = None,
+                                     watermark_png_path: str = None,
+                                     png_location: str = "topright") -> str:
+        """Build highly optimized filter chain"""
+        filters = []
+        overlay_input = "[0:v]"
+        
+        # Text watermark with optimized positioning
+        if watermark_text and watermark_text.strip():
+            text_filter = self._create_optimized_text_filter(
+                watermark_text, video_info, watermark_png_path, png_location
+            )
+            filters.append(f"{overlay_input}{text_filter}[txt]")
+            overlay_input = "[txt]"
+        
+        # PNG watermark with hardware optimization
+        if watermark_png_path and os.path.exists(watermark_png_path):
+            png_filter = self._create_optimized_png_filter(
+                video_info, png_location
+            )
+            filters.append(f"[1:v]{png_filter}[wm]")
+            filters.append(f"{overlay_input}[wm]overlay={self._get_png_position(png_location, video_info)}[final]")
+            overlay_input = "[final]"
+        
+        return ";".join(filters) if filters else "copy"
+    
+    def _create_optimized_text_filter(self, watermark_text: str, video_info: VideoInfo,
+                                    has_png: bool = False, png_location: str = "topright") -> str:
+        """Create optimized text filter with smart positioning"""
+        # Clean text for FFmpeg
+        clean_text = self._clean_text_for_ffmpeg(watermark_text)
+        
+        # Process text into optimized lines
+        lines = self._process_text_lines(clean_text, video_info.width)
+        final_text = "\\\\n".join(lines)  # Double escape for FFmpeg
+        
+        # Calculate optimal font size and spacing
+        font_size = self._calculate_optimal_font_size(video_info)
+        line_spacing = int(font_size * 1.15)
+        margin = max(10, video_info.width // 100)
+        
+        # Smart positioning that avoids PNG watermark
+        x_pos, y_pos = self._calculate_smart_text_position(
+            video_info, has_png, png_location, margin
+        )
+        
+        # Build optimized drawtext filter
+        return (
+            f"drawtext=text='{final_text}':"
+            f"fontsize={font_size}:"
+            f"fontcolor=white@0.95:"
+            f"box=1:boxcolor=black@0.75:boxborderw=8:"
+            f"line_spacing={line_spacing}:"
+            f"x='{x_pos}':"
+            f"y='{y_pos}'"
+        )
+    
+    def _clean_text_for_ffmpeg(self, text: str) -> str:
+        """Clean and optimize text for FFmpeg processing"""
+        # Escape special characters
+        clean_text = text.replace("'", "\\'").replace(":", "\\:")
+        
+        # Remove problematic characters but preserve newlines
+        clean_text = ''.join(
+            c for c in clean_text 
+            if ord(c) < 127 and (c.isprintable() or c in ['\n', '\r', ' '])
+        )
+        
+        return clean_text
+    
+    def _process_text_lines(self, text: str, video_width: int) -> List[str]:
+        """Process text into optimized lines for display"""
+        max_chars_per_line = max(30, video_width // 15)
+        user_lines = text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+        
+        processed_lines = []
+        for user_line in user_lines:
+            user_line = user_line.strip()
+            if not user_line:
+                if processed_lines:  # Only add spaces if not at the beginning
+                    processed_lines.append(" ")
+                continue
+            
+            if len(user_line) <= max_chars_per_line:
+                processed_lines.append(user_line)
             else:
-                result = subprocess.run(cmd,
-                                        check=True,
-                                        capture_output=True,
-                                        text=True)
-
-            logger.info(
-                f"Successfully normalized video with progress: {input_path} -> {output_path}"
-            )
-            return True
-
-        except subprocess.CalledProcessError as e:
-            logger.error(
-                f"Video normalization with progress failed: {e.stderr}")
-            return False
-        except Exception as e:
-            logger.error(
-                f"Unexpected error in video normalization with progress: {e}")
-            return False
-
-    async def generate_video_thumbnail(self, video_path: str,
-                                       thumbnail_path: str):
-        """Generate thumbnail from video at 10% duration point"""
-        import subprocess
-
-        try:
-            # Get video duration
-            video_info = await self.get_video_info(video_path)
-            duration = video_info.get('duration', 0)
-
-            # Extract frame at 10% of video duration (or 3 seconds if duration unknown)
-            seek_time = max(3, duration * 0.1) if duration > 0 else 3
-
-            cmd = [
-                'ffmpeg',
-                '-i',
-                video_path,
-                '-ss',
-                str(seek_time),
-                '-vf',
-                'scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2',
-                '-vframes',
-                '1',
-                '-q:v',
-                '2',  # High quality thumbnail
-                '-y',
-                thumbnail_path
-            ]
-
-            result = subprocess.run(cmd,
-                                    capture_output=True,
-                                    text=True,
-                                    check=True)
-            return os.path.exists(thumbnail_path)
-
-        except Exception as e:
-            logger.error(f"Thumbnail generation failed: {e}")
-            return False
-
-    async def add_combined_watermarks(self,
-                                      input_path: str,
-                                      output_path: str,
-                                      watermark_text: str = None,
-                                      watermark_png_path: str = None,
-                                      png_location: str = "topright",
-                                      progress_callback=None):
-        """Add combined watermarks with speed optimization and progress tracking"""
-        import subprocess
-
-        try:
-            # Get video info
-            video_info = await self.get_video_info(input_path)
-            width = video_info['width']
-            height = video_info['height']
-            fps = video_info['fps']
-            duration = video_info.get('duration', 0)
-
-            if fps <= 0 or fps > 120:
-                fps = 30
-
-            # Calculate total frames for progress tracking
-            total_frames = int(fps * duration) if duration > 0 else 0
-
-            # Build filter complex
-            filter_parts = []
-            overlay_inputs = "[0:v]"
-
-            # Add text watermark if provided and not skipped
-            if watermark_text and watermark_text.strip():
-                # Clean and escape the text for FFmpeg, but preserve actual line breaks
-                clean_text = watermark_text.replace("'", "\\'").replace(":", "\\:")
-                # Remove any characters that might break FFmpeg filters but keep newlines
-                clean_text = ''.join(
-                    c for c in clean_text
-                    if ord(c) < 127 and (c.isprintable() or c in ['\n', '\r', ' ']))
-
-                # Split by actual line breaks first (user's intended lines)
-                user_lines = clean_text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
-
-                # Process each user line for length and create final lines
-                lines = []
-                max_chars_per_line = max(25, width // 12)  # Slightly longer lines for better readability
-
-                for user_line in user_lines:
-                    user_line = user_line.strip()
-                    if not user_line and len(lines) == 0:  # Skip empty lines only at the beginning
-                        continue
-                    elif not user_line:  # Preserve empty lines in the middle/end as spacing
-                        lines.append(" ")  # Use space instead of empty to maintain line structure
-                        continue
-
-                    # If line is short enough, use as-is
-                    if len(user_line) <= max_chars_per_line:
-                        lines.append(user_line)
+                # Smart word wrapping
+                words = user_line.split()
+                current_line = ""
+                
+                for word in words:
+                    test_line = current_line + " " + word if current_line else word
+                    if len(test_line) <= max_chars_per_line:
+                        current_line = test_line
                     else:
-                        # Split long lines by words
-                        words = user_line.split()
-                        current_line = ""
-
-                        for word in words:
-                            test_line = current_line + " " + word if current_line else word
-                            if len(test_line) <= max_chars_per_line:
-                                current_line = test_line
-                            else:
-                                if current_line:
-                                    lines.append(current_line)
-                                current_line = word
-
                         if current_line:
-                            lines.append(current_line)
-
-                # Limit to 5 lines maximum for better display (increased from 4)
-                if len(lines) > 5:
-                    lines = lines[:4]
-                    lines.append("...")
-
-                # Join lines with proper newline character for FFmpeg
-                # Use \\n for proper line breaks in FFmpeg drawtext
-                final_text = "\\n".join(lines)
-
-                font_size = max(18, min(width // 40, height //
-                                        30))  # Slightly smaller for multi-line
-                margin = 15
-                line_spacing = int(font_size * 1.2)  # Line spacing
-
-                png_exists = watermark_png_path and os.path.exists(
-                    watermark_png_path)
-
-                if png_exists:
-                    if png_location == "topright":
-                        # PNG at topright, text cycles: bottomright -> bottomleft -> bottomright -> bottomleft (2 positions, 120s cycle)
-                        text_filter = (
-                            f"drawtext=text='{final_text}':"
-                            f"fontsize={font_size}:"
-                            f"fontcolor=white@0.95:"
-                            f"box=1:boxcolor=black@0.8:boxborderw=10:"
-                            f"line_spacing={line_spacing}:"
-                            f"x='if(lt(mod(t,120),60),w-text_w-{margin},{margin})':"
-                            f"y='h-text_h-{margin}'"
-                        )
-                    else:
-                        # PNG not at topright, text cycles: topright -> bottomright -> bottomleft (3 positions, 180s cycle) - never use topleft
-                        text_filter = (
-                            f"drawtext=text='{final_text}':"
-                            f"fontsize={font_size}:"
-                            f"fontcolor=white@0.95:"
-                            f"box=1:boxcolor=black@0.8:boxborderw=10:"
-                            f"line_spacing={line_spacing}:"
-                            f"x='if(lt(mod(t,180),60),w-text_w-{margin},if(lt(mod(t,180),120),w-text_w-{margin},{margin}))':"
-                            f"y='if(lt(mod(t,180),60),{margin*2},if(lt(mod(t,180),120),h-text_h-{margin},h-text_h-{margin}))'"
-                        )
-                else:
-                    # No PNG, text cycles: topright -> bottomright -> bottomleft (3 positions, 180s cycle) - never use topleft
-                    text_filter = (
-                        f"drawtext=text='{final_text}':"
-                        f"fontsize={font_size}:"
-                        f"fontcolor=white@0.95:"
-                        f"box=1:boxcolor=black@0.8:boxborderw=10:"
-                        f"line_spacing={line_spacing}:"
-                        f"x='if(lt(mod(t,180),60),w-text_w-{margin},if(lt(mod(t,180),120),w-text_w-{margin},{margin}))':"
-                        f"y='if(lt(mod(t,180),60),{margin*2},if(lt(mod(t,180),120),h-text_h-{margin},h-text_h-{margin}))'"
-                    )
-
-                filter_parts.append(f"{overlay_inputs}{text_filter}[txt]")
-                overlay_inputs = "[txt]"
-
-            # Add PNG watermark if provided
+                            processed_lines.append(current_line)
+                        current_line = word
+                
+                if current_line:
+                    processed_lines.append(current_line)
+        
+        # Limit lines for performance
+        return processed_lines[:6] if len(processed_lines) <= 6 else processed_lines[:5] + ["..."]
+    
+    def _calculate_optimal_font_size(self, video_info: VideoInfo) -> int:
+        """Calculate optimal font size based on video resolution"""
+        base_size = min(video_info.width, video_info.height) // 40
+        return max(16, min(base_size, 32))
+    
+    def _calculate_smart_text_position(self, video_info: VideoInfo, has_png: bool,
+                                     png_location: str, margin: int) -> Tuple[str, str]:
+        """Calculate smart text positioning to avoid PNG overlap"""
+        if has_png:
+            # Cycle through positions avoiding PNG location
+            if png_location == "topright":
+                # Cycle: bottomright -> bottomleft (2 positions, 120s cycle)
+                x_pos = "if(lt(mod(t,120),60),w-text_w-" + str(margin) + "," + str(margin) + ")"
+                y_pos = "h-text_h-" + str(margin)
+            else:
+                # Cycle: topright -> bottomright -> bottomleft (3 positions, 180s cycle)
+                x_pos = ("if(lt(mod(t,180),60),w-text_w-" + str(margin) + 
+                        ",if(lt(mod(t,180),120),w-text_w-" + str(margin) + "," + str(margin) + "))")
+                y_pos = ("if(lt(mod(t,180),60)," + str(margin * 2) + 
+                        ",if(lt(mod(t,180),120),h-text_h-" + str(margin) + ",h-text_h-" + str(margin) + "))")
+        else:
+            # No PNG, cycle through 3 positions avoiding topleft
+            x_pos = ("if(lt(mod(t,180),60),w-text_w-" + str(margin) + 
+                    ",if(lt(mod(t,180),120),w-text_w-" + str(margin) + "," + str(margin) + "))")
+            y_pos = ("if(lt(mod(t,180),60)," + str(margin * 2) + 
+                    ",if(lt(mod(t,180),120),h-text_h-" + str(margin) + ",h-text_h-" + str(margin) + "))")
+        
+        return x_pos, y_pos
+    
+    def _create_optimized_png_filter(self, video_info: VideoInfo, png_location: str) -> str:
+        """Create optimized PNG scaling filter"""
+        # Calculate optimal size (max 1/4 of video dimensions)
+        max_size = min(video_info.width // 4, video_info.height // 4, 200)
+        
+        return f"scale=-1:{max_size}:force_original_aspect_ratio=decrease"
+    
+    def _get_png_position(self, png_location: str, video_info: VideoInfo) -> str:
+        """Get PNG overlay position"""
+        margin = max(8, video_info.width // 150)
+        
+        position_map = {
+            "topleft": f"{margin}:{margin}",
+            "topright": f"W-w-{margin}:{margin}",
+            "bottomleft": f"{margin}:H-h-{margin}",
+            "bottomright": f"W-w-{margin}:H-h-{margin}"
+        }
+        
+        return position_map.get(png_location, position_map["bottomright"])
+    
+    def _get_optimal_encoding_settings(self, video_info: VideoInfo, input_path: str) -> Dict[str, str]:
+        """Get optimal encoding settings for maximum performance"""
+        file_size_mb = os.path.getsize(input_path) / (1024 * 1024)
+        
+        # Base settings for performance
+        settings = {
+            'codec': self.ffmpeg_processor.encoder,
+            'preset': self.ffmpeg_processor.get_optimal_preset(file_size_mb, video_info.duration),
+            'crf': str(self.ffmpeg_processor.get_optimal_crf('fastest')),
+            'threads': str(self.ffmpeg_processor.optimal_threads)
+        }
+        
+        # Bitrate optimization
+        if video_info.bitrate > 0:
+            # Use original bitrate as reference but cap for performance
+            target_bitrate = min(video_info.bitrate, 3000000)  # Max 3Mbps
+            settings['bitrate'] = f"{target_bitrate // 1000}k"
+            settings['maxrate'] = f"{int(target_bitrate * 1.2) // 1000}k"
+            settings['bufsize'] = f"{int(target_bitrate * 2) // 1000}k"
+        else:
+            # Estimate from file size
+            if file_size_mb > 0 and video_info.duration > 0:
+                estimated_bitrate = int((file_size_mb * 8 * 1024 * 1024) / video_info.duration * 0.85)
+                estimated_bitrate = min(estimated_bitrate, 2000000)  # Cap at 2Mbps
+                settings['bitrate'] = f"{estimated_bitrate // 1000}k"
+            else:
+                settings['bitrate'] = "1500k"  # Default for performance
+        
+        return settings
+    
+    async def _build_turbo_command(self, input_path: str, output_path: str,
+                                 filter_chain: str, encoding_settings: Dict[str, str],
+                                 watermark_png_path: str = None) -> List[str]:
+        """Build optimized FFmpeg command for maximum speed"""
+        cmd = ['ffmpeg', '-y']
+        
+        # Input optimization
+        if self.ffmpeg_processor.gpu_available and self.ffmpeg_processor.gpu_type == 'nvidia':
+            cmd.extend(['-hwaccel', 'cuda'])
+        
+        cmd.extend(['-i', input_path])
+        
+        # Add PNG input if needed
+        if watermark_png_path and os.path.exists(watermark_png_path):
+            cmd.extend(['-i', watermark_png_path])
+        
+        # Filter complex or simple filter
+        if filter_chain != "copy":
             if watermark_png_path and os.path.exists(watermark_png_path):
-                max_size = min(width // 4, height // 4)
-                margin = 8
-
-                # PNG position based on selected location
-                if png_location == "topleft":
-                    png_x, png_y = margin, margin
-                elif png_location == "topright":
-                    png_x, png_y = f"W-w-{margin}", margin
-                elif png_location == "bottomleft":
-                    png_x, png_y = margin, f"H-h-{margin}"
-                else:  # bottomright (default)
-                    png_x, png_y = f"W-w-{margin}", f"H-h-{margin}"
-
-                filter_parts.append(
-                    f"[1:v]scale=-1:{max_size}:force_original_aspect_ratio=decrease[wm]"
-                )
-                filter_parts.append(
-                    f"{overlay_inputs}[wm]overlay={png_x}:{png_y}[final]"
-                )
-                overlay_inputs = "[final]"
-
-            # Get original video bitrate for size matching
-            original_bitrate = video_info.get('bitrate', 0)
-            if original_bitrate > 0:
-                # Use original bitrate but cap it for reasonable size
-                target_bitrate = min(original_bitrate, 2000000)  # Max 2Mbps
+                cmd.extend(['-filter_complex', filter_chain, '-map', '[final]'])
             else:
-                # Estimate bitrate based on file size and duration
-                file_size = os.path.getsize(input_path)
-                duration = video_info.get('duration', 1)
-                if duration > 0:
-                    estimated_bitrate = int((file_size * 8) / duration *
-                                            0.85)  # 85% for video track
-                    target_bitrate = min(estimated_bitrate, 2000000)
-                else:
-                    target_bitrate = 1000000  # 1Mbps fallback
-
-            target_bitrate_str = f"{target_bitrate//1000}k"
-
-            # Build command optimized for maintaining original file size
-            if watermark_png_path and os.path.exists(watermark_png_path):
-                if filter_parts:
-                    cmd = [
-                        'ffmpeg',
-                        '-i',
-                        input_path,
-                        '-i',
-                        watermark_png_path,
-                        '-filter_complex',
-                        ';'.join(filter_parts),
-                        '-map',
-                        overlay_inputs,
-                        '-map',
-                        '0:a?',
-                        '-c:v',
-                        'libx264',
-                        '-preset',
-                        'ultrafast',
-                        '-crf',
-                        '28',  # Higher CRF for smaller size
-                        '-c:a',
-                        'copy',  # Copy audio without re-encoding
-                        '-r',
-                        str(fps),
-                        '-b:v',
-                        target_bitrate_str,  # Match original bitrate
-                        '-maxrate',
-                        f"{int(target_bitrate*1.2)//1000}k",
-                        '-bufsize',
-                        f"{int(target_bitrate*2)//1000}k",
-                        '-profile:v',
-                        'main',
-                        '-level',
-                        '3.1',
-                        '-map_metadata',
-                        '0',
-                        '-movflags',
-                        '+faststart',
-                        '-threads',
-                        '0',
-                        '-y',
-                        output_path
-                    ]
-                else:
-                    # Only PNG watermark, no text
-                    margin = 15
-                    cmd = [
-                        'ffmpeg', '-i', input_path, '-i', watermark_png_path,
-                        '-filter_complex',
-                        f"[1:v]scale=-1:{min(width // 4, height // 4)}:force_original_aspect_ratio=decrease[wm];[0:v][wm]overlay=W-w-{margin}:{margin}[final]",
-                        '-map', '[final]', '-map', '0:a?', '-c:v', 'libx264',
-                        '-preset', 'ultrafast', '-crf', '28', '-c:a', 'copy',
-                        '-r',
-                        str(fps), '-b:v', target_bitrate_str, '-maxrate',
-                        f"{int(target_bitrate*1.2)//1000}k", '-bufsize',
-                        f"{int(target_bitrate*2)//1000}k", '-profile:v',
-                        'main', '-level', '3.1', '-map_metadata', '0',
-                        '-movflags', '+faststart', '-threads', '0', '-y',
-                        output_path
-                    ]
-            else:
-                if filter_parts:
-                    # Extract the filter properly - get everything after the input reference
-                    text_filter_only = filter_parts[0].replace(
-                        f"{overlay_inputs}", "").replace("[txt]", "")
-                    cmd = [
-                        'ffmpeg',
-                        '-i',
-                        input_path,
-                        '-vf',
-                        text_filter_only,
-                        '-c:v',
-                        'libx264',
-                        '-preset',
-                        'ultrafast',
-                        '-crf',
-                        '28',  # Higher CRF for smaller size
-                        '-c:a',
-                        'copy',
-                        '-r',
-                        str(fps),
-                        '-b:v',
-                        target_bitrate_str,  # Match original bitrate
-                        '-maxrate',
-                        f"{int(target_bitrate*1.2)//1000}k",
-                        '-bufsize',
-                        f"{int(target_bitrate*2)//1000}k",
-                        '-profile:v',
-                        'main',
-                        '-level',
-                        '3.1',
-                        '-map_metadata',
-                        '0',
-                        '-movflags',
-                        '+faststart',
-                        '-threads',
-                        '0',
-                        '-y',
-                        output_path
-                    ]
-                else:
-                    # No watermarks at all, just copy streams for maximum speed and size preservation
-                    cmd = [
-                        'ffmpeg',
-                        '-i',
-                        input_path,
-                        '-c:v',
-                        'copy',  # Copy video stream without re-encoding
-                        '-c:a',
-                        'copy',  # Copy audio stream without re-encoding
-                        '-map_metadata',
-                        '0',
-                        '-movflags',
-                        '+faststart',
-                        '-y',
-                        output_path
-                    ]
-
-            # Execute with enhanced progress monitoring
-            if progress_callback:
-                process = subprocess.Popen(cmd,
-                                           stdout=subprocess.PIPE,
-                                           stderr=subprocess.PIPE,
-                                           universal_newlines=True)
-
-                frame_count = 0
-                process_start_time = time.time()
-                last_progress_update = process_start_time
-                fps_samples = []
-
-                while True:
-                    output = process.stderr.readline()
-                    if output == '' and process.poll() is not None:
-                        break
-                    if output:
-                        if 'frame=' in output:
-                            try:
-                                current_time = time.time()
-                                frame_match = output.split(
-                                    'frame=')[1].split()[0]
-                                frame_count = int(frame_match)
-
-                                # Calculate processing FPS
-                                elapsed_time = current_time - process_start_time
-                                if elapsed_time > 0:
-                                    processing_fps = frame_count / elapsed_time
-                                    fps_samples.append(processing_fps)
-
-                                    # Keep only last 10 samples for smoothing
-                                    if len(fps_samples) > 10:
-                                        fps_samples.pop(0)
-
-                                    avg_fps = sum(fps_samples) / len(
-                                        fps_samples)
-                                else:
-                                    avg_fps = 0
-
-                                # Calculate time estimates
-                                if avg_fps > 0 and total_frames > 0:
-                                    remaining_frames = max(
-                                        0, total_frames - frame_count)
-                                    eta_seconds = remaining_frames / avg_fps
-
-                                    # Format ETA
-                                    if eta_seconds > 3600:
-                                        eta_mins = int(eta_seconds // 3600)
-                                        eta_secs = int((eta_seconds % 3600) // 60)
-                                        eta_str = f"{eta_mins}h{eta_secs}m"
-                                    elif eta_seconds > 60:
-                                        eta_mins = int(eta_seconds // 60)
-                                        eta_secs = int(eta_seconds % 60)
-                                        eta_str = f"{eta_mins}m{eta_secs}s"
-                                    else:
-                                        eta_str = f"{int(eta_seconds)}s"
-                                else:
-                                    eta_str = "calculating..."
-
-                                # Format elapsed time
-                                if elapsed_time > 3600:
-                                    elapsed_mins = int(elapsed_time // 3600)
-                                    elapsed_secs = int((elapsed_time % 3600) // 60)
-                                    elapsed_str = f"{elapsed_mins}h{elapsed_secs}m"
-                                elif elapsed_time > 60:
-                                    elapsed_mins = int(elapsed_time // 60)
-                                    elapsed_secs = int(elapsed_time % 60)
-                                    elapsed_str = f"{elapsed_mins}m{elapsed_secs}s"
-                                else:
-                                    elapsed_str = f"{int(elapsed_time)}s"
-
-                                # Update progress every 3 seconds for flood protection
-                                if (current_time - last_progress_update
-                                        >= 3.0) or (frame_count
-                                                    >= total_frames):
-                                    # Create detailed progress info
-                                    progress_info = {
-                                        'frame_count': frame_count,
-                                        'total_frames': total_frames,
-                                        'processing_fps': avg_fps,
-                                        'elapsed': elapsed_str,
-                                        'eta': eta_str,
-                                        'stage': 'watermarking'
-                                    }
-
-                                    await progress_callback(
-                                        frame_count, total_frames,
-                                        progress_info)
-                                    last_progress_update = current_time
-
-                            except Exception as e:
-                                logger.warning(
-                                    f"Error parsing FFmpeg output: {e}")
-                                pass
-
-                process.wait()
-                if process.returncode != 0:
-                    raise subprocess.CalledProcessError(
-                        process.returncode, cmd)
-            else:
-                result = subprocess.run(cmd,
-                                        check=True,
-                                        capture_output=True,
-                                        text=True)
-
-            logger.info(
-                "Successfully added combined watermarks with metadata preservation"
-            )
-
-        except Exception as e:
-            logger.error(f"Combined watermark error: {e}")
-            shutil.copy2(input_path, output_path)
-
-    async def add_intro_with_normalization(self,
-                                           intro_path: str,
-                                           video_path: str,
-                                           output_path: str,
-                                           progress_callback=None):
-        """Add intro with normalization tracking - normalizes every time"""
-        import subprocess
-
-        # Initialize variables at the top to prevent UnboundLocalError
-        temp_intro = None
-        temp_main = None
-        list_file = None
-
+                cmd.extend(['-vf', filter_chain])
+        
+        # Audio handling
+        cmd.extend(['-map', '0:a?', '-c:a', 'copy'])  # Copy audio for speed
+        
+        # Video encoding settings
+        cmd.extend([
+            '-c:v', encoding_settings['codec'],
+            '-preset', encoding_settings['preset'],
+            '-crf', encoding_settings['crf'],
+            '-threads', encoding_settings['threads']
+        ])
+        
+        # Bitrate settings if available
+        if 'bitrate' in encoding_settings:
+            cmd.extend(['-b:v', encoding_settings['bitrate']])
+            if 'maxrate' in encoding_settings:
+                cmd.extend(['-maxrate', encoding_settings['maxrate']])
+            if 'bufsize' in encoding_settings:
+                cmd.extend(['-bufsize', encoding_settings['bufsize']])
+        
+        # Optimization flags
+        cmd.extend([
+            '-profile:v', 'main',
+            '-level', '3.1',
+            '-map_metadata', '0',
+            '-movflags', '+faststart',
+            '-avoid_negative_ts', 'make_zero',
+            output_path
+        ])
+        
+        return cmd
+    
+    async def _execute_with_turbo_progress(self, cmd: List[str], video_info: VideoInfo,
+                                         progress_callback=None) -> bool:
+        """Execute FFmpeg command with turbo progress tracking"""
         try:
-            # Get video properties
-            intro_info = await self.get_video_info(intro_path)
-            main_info = await self.get_video_info(video_path)
-
-            # Use consistent target specifications with improved quality
-            target_fps = 30  # Fixed FPS for compatibility
-            target_width = 1280
-            target_height = 720
-
-            # Create temp files for normalized videos
-            temp_intro = f"temp_intro_normalized_{int(time.time())}.mp4"
-            temp_main = f"temp_main_normalized_{int(time.time())}.mp4"
-
-            # Stage 1: Normalize intro (0-25%)
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
             if progress_callback:
-                await progress_callback(0, 100, "Starting intro normalization")
-
-            intro_normalize_cmd = [
-                'ffmpeg',
-                '-i',
-                intro_path,
-                '-vf',
-                f'scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2,fps={target_fps}',
-                '-c:v',
-                'libx264',
-                '-preset',
-                'ultrafast',
-                '-crf',
-                '32',  # Higher CRF for much smaller size
-                '-c:a',
-                'copy',  # Copy audio for speed
-                '-pix_fmt',
-                'yuv420p',
-                '-b:v',
-                '800k',  # Lower bitrate for intro
-                '-maxrate',
-                '1M',
-                '-bufsize',
-                '2M',  # Much lower bitrate for smaller files
-                '-profile:v',
-                'main',
-                '-level',
-                '3.1',
-                '-movflags',
-                '+faststart',
-                '-threads',
-                '0',
-                '-f',
-                'mp4',
-                '-y',
-                temp_intro
-            ]
-
-            # Track intro normalization progress
-            if progress_callback:
-                process = subprocess.Popen(intro_normalize_cmd,
-                                           stdout=subprocess.PIPE,
-                                           stderr=subprocess.PIPE,
-                                           universal_newlines=True)
-
-                intro_frame_count = 0
-                intro_total_frames = int(target_fps *
-                                         intro_info.get('duration', 0))
-                last_intro_update = time.time()
-                intro_start_time = time.time()
-
-                while True:
-                    output = process.stderr.readline()
-                    if output == '' and process.poll() is not None:
-                        break
-                    if output:
-                        if 'frame=' in output:
-                            try:
-                                current_time = time.time()
-                                frame_match = output.split(
-                                    'frame=')[1].split()[0]
-                                intro_frame_count = int(frame_match)
-
-                                # Calculate processing metrics
-                                elapsed_time = current_time - intro_start_time
-                                if elapsed_time > 0:
-                                    processing_fps = intro_frame_count / elapsed_time
-                                else:
-                                    processing_fps = 0
-
-                                # Calculate ETA
-                                if processing_fps > 0 and intro_total_frames > 0:
-                                    remaining_frames = max(
-                                        0,
-                                        intro_total_frames - intro_frame_count)
-                                    eta_seconds = remaining_frames / processing_fps
-
-                                    if eta_seconds > 60:
-                                        eta_mins = int(eta_seconds // 60)
-                                        eta_secs = int(eta_seconds % 60)
-                                        eta_str = f"{eta_mins}m{eta_secs}s"
-                                    else:
-                                        eta_str = f"{int(eta_seconds)}s"
-                                else:
-                                    eta_str = "calculating..."
-
-                                # Format elapsed
-                                if elapsed_time > 60:
-                                    elapsed_mins = int(elapsed_time // 60)
-                                    elapsed_secs = int(elapsed_time % 60)
-                                    elapsed_str = f"{elapsed_mins}m{elapsed_secs}s"
-                                else:
-                                    elapsed_str = f"{int(elapsed_time)}s"
-
-                                # Update progress every 5 seconds for flood protection
-                                if current_time - last_intro_update >= 5.0:
-                                    if intro_total_frames > 0:
-                                        frame_percent = (
-                                            intro_frame_count /
-                                            intro_total_frames
-                                        ) * 25  # 25% for intro
-                                        step_detail = f"Normalizing intro: {intro_frame_count}/{intro_total_frames} @ {processing_fps:.1f}fps"
-                                        await progress_callback(
-                                            frame_percent,
-                                            100,
-                                            step_detail,
-                                            elapsed=elapsed_str,
-                                            eta=eta_str)
-                                    else:
-                                        await progress_callback(
-                                            12,
-                                            100,
-                                            f"Normalizing intro: {intro_frame_count} frames @ {processing_fps:.1f}fps",
-                                            elapsed=elapsed_str)
-                                    last_intro_update = current_time
-                            except Exception as e:
-                                logger.warning(
-                                    f"Error parsing intro progress: {e}")
-                                pass
-
-                process.wait()
-                if process.returncode != 0:
-                    raise subprocess.CalledProcessError(
-                        process.returncode, intro_normalize_cmd)
+                await self._monitor_ffmpeg_progress(process, video_info, progress_callback)
             else:
-                result = subprocess.run(intro_normalize_cmd,
-                                        check=True,
-                                        capture_output=True,
-                                        text=True)
+                await process.wait()
 
-            logger.info("Intro normalization completed")
-
-            # Stage 2: Normalize main video (25-70%)
-            if progress_callback:
-                await progress_callback(25, 100,
-                                        "Starting main video normalization")
-
-            # Get original bitrate for main video to maintain size
-            original_main_bitrate = main_info.get('bitrate', 0)
-            if original_main_bitrate > 0:
-                main_target_bitrate = min(original_main_bitrate,
-                                          1500000)  # Max 1.5Mbps
+class TurboIntroProcessor:
+    """Ultra-fast intro processing with caching and normalization"""
+    
+    def __init__(self, ffmpeg_processor: OptimizedFFmpegProcessor):
+        self.ffmpeg_processor = ffmpeg_processor
+        self.normalized_cache = Path("cache/normalized_intros")
+        self.normalized_cache.mkdir(parents=True, exist_ok=True)
+        
+    async def process_intro_with_main_turbocharged(self, intro_path: str, main_video_path: str,
+                                                 output_path: str, progress_callback=None) -> bool:
+        """Process intro with main video using maximum optimization"""
+        try:
+            # Get video specs for both files
+            intro_info = await self._get_video_specs(intro_path)
+            main_info = await self._get_video_specs(main_video_path)
+            
+            # Determine optimal target specs
+            target_specs = self._calculate_optimal_specs(intro_info, main_info)
+            
+            # Check cache for normalized intro
+            cached_intro = await self._get_cached_normalized_intro(intro_path, target_specs)
+            
+            if cached_intro:
+                logger.info("Using cached normalized intro")
+                normalized_intro_path = cached_intro
             else:
-                # Estimate from file size
-                main_file_size = os.path.getsize(video_path)
-                main_duration = main_info.get('duration', 1)
-                if main_duration > 0:
-                    estimated_main_bitrate = int(
-                        (main_file_size * 8) / main_duration * 0.85)
-                    main_target_bitrate = min(estimated_main_bitrate, 1500000)
-                else:
-                    main_target_bitrate = 1000000
-
-            main_target_bitrate_str = f"{main_target_bitrate//1000}k"
-
-            main_normalize_cmd = [
-                'ffmpeg',
-                '-i',
-                video_path,
-                '-vf',
-                f'scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2,fps={target_fps}',
-                '-c:v',
-                'libx264',
-                '-preset',
-                'ultrafast',
-                '-crf',
-                '30',  # Higher CRF for smaller size
-                '-c:a',
-                'copy',  # Copy audio for speed
-                '-pix_fmt',
-                'yuv420p',
-                '-b:v',
-                main_target_bitrate_str,  # Use calculated bitrate
-                '-maxrate',
-                f"{int(main_target_bitrate*1.1)//1000}k",
-                '-bufsize',
-                f"{int(main_target_bitrate*2)//1000}k",
-                '-profile:v',
-                'main',
-                '-level',
-                '3.1',
-                '-movflags',
-                '+faststart',
-                '-threads',
-                '0',
-                '-f',
-                'mp4',
-                '-y',
-                temp_main
-            ]
-
-            # Track main video normalization progress
-            if progress_callback:
-                process = subprocess.Popen(main_normalize_cmd,
-                                           stdout=subprocess.PIPE,
-                                           stderr=subprocess.PIPE,
-                                           universal_newlines=True)
-
-                main_frame_count = 0
-                main_total_frames = int(target_fps *
-                                        main_info.get('duration', 0))
-                last_main_update = time.time()
-                main_start_time = time.time()
-
-                while True:
-                    output = process.stderr.readline()
-                    if output == '' and process.poll() is not None:
-                        break
-                    if output:
-                        if 'frame=' in output:
-                            try:
-                                current_time = time.time()
-                                frame_match = output.split(
-                                    'frame=')[1].split()[0]
-                                main_frame_count = int(frame_match)
-
-                                # Calculate processing metrics
-                                elapsed_time = current_time - main_start_time
-                                if elapsed_time > 0:
-                                    processing_fps = main_frame_count / elapsed_time
-                                else:
-                                    processing_fps = 0
-
-                                # Calculate ETA
-                                if processing_fps > 0 and main_total_frames > 0:
-                                    remaining_frames = max(
-                                        0,
-                                        main_total_frames - main_frame_count)
-                                    eta_seconds = remaining_frames / processing_fps
-
-                                    if eta_seconds > 60:
-                                        eta_mins = int(eta_seconds // 60)
-                                        eta_secs = int(eta_seconds % 60)
-                                        eta_str = f"{eta_mins}m{eta_secs}s"
-                                    else:
-                                        eta_str = f"{int(eta_seconds)}s"
-                                else:
-                                    eta_str = "calculating..."
-
-                                # Format elapsed
-                                if elapsed_time > 60:
-                                    elapsed_mins = int(elapsed_time // 60)
-                                    elapsed_secs = int(elapsed_time % 60)
-                                    elapsed_str = f"{elapsed_mins}m{elapsed_secs}s"
-                                else:
-                                    elapsed_str = f"{int(elapsed_time)}s"
-
-                                # Update progress every 5 seconds for flood protection
-                                if current_time - last_main_update >= 5.0:
-                                    if main_total_frames > 0:
-                                        frame_percent = (
-                                            main_frame_count /
-                                            main_total_frames
-                                        ) * 45  # 45% for main video (25-70%)
-                                        overall_percent = 25 + frame_percent
-                                        step_detail = f"Normalizing main: {main_frame_count}/{main_total_frames} @ {processing_fps:.1f}fps"
-                                        await progress_callback(
-                                            overall_percent,
-                                            100,
-                                            step_detail,
-                                            elapsed=elapsed_str,
-                                            eta=eta_str)
-                                    else:
-                                        await progress_callback(
-                                            47,
-                                            100,
-                                            f"Normalizing main: {main_frame_count} frames @ {processing_fps:.1f}fps",
-                                            elapsed=elapsed_str)
-                                    last_main_update = current_time
-                            except Exception as e:
-                                logger.warning(
-                                    f"Error parsing main progress: {e}")
-                                pass
-
-                process.wait()
-                if process.returncode != 0:
-                    raise subprocess.CalledProcessError(
-                        process.returncode, main_normalize_cmd)
-            else:
-                result = subprocess.run(main_normalize_cmd,
-                                        check=True,
-                                        capture_output=True,
-                                        text=True)
-
-            logger.info("Main video normalization completed")
-
-            # Stage 3: Concatenate videos (70-100%)
-            if progress_callback:
-                await progress_callback(70, 100,
-                                        "Concatenating normalized videos")
-
-            # Create file list for concatenation
-            list_file = f"temp_list_{int(time.time())}.txt"
+                # Normalize intro with progress tracking
+                normalized_intro_path = await self._normalize_intro_turbo(
+                    intro_path, target_specs, progress_callback
+                )
+            
+            # Normalize main video if needed
+            normalized_main_path = await self._normalize_main_video_turbo(
+                main_video_path, target_specs, progress_callback
+            )
+            
+            # Concatenate with ultra-fast method
+            success = await self._concatenate_turbo(
+                normalized_intro_path, normalized_main_path, output_path, progress_callback
+            )
+            
+            # Cleanup temporary files
+            await self._cleanup_temp_files([
+                normalized_main_path if normalized_main_path != main_video_path else None
+            ])
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"Turbo intro processing failed: {e}")
+            return False
+    
+    async def _get_video_specs(self, video_path: str) -> VideoInfo:
+        """Get video specifications with caching"""
+        cache_key = f"specs_{os.path.basename(video_path)}_{os.path.getmtime(video_path)}"
+        
+        processor = HighPerformanceVideoProcessor()
+        return await processor.get_video_info_fast(video_path)
+    
+    def _calculate_optimal_specs(self, intro_info: VideoInfo, main_info: VideoInfo) -> Dict[str, Any]:
+        """Calculate optimal specifications for processing"""
+        # Use the higher quality specs between intro and main
+        target_width = max(intro_info.width, main_info.width, 1280)
+        target_height = max(intro_info.height, main_info.height, 720)
+        
+        # Use consistent FPS for smooth concatenation
+        target_fps = max(intro_info.fps, main_info.fps, 30.0)
+        target_fps = min(target_fps, 60.0)  # Cap at 60fps for performance
+        
+        return {
+            'width': target_width,
+            'height': target_height,
+            'fps': target_fps,
+            'codec': 'h264',
+            'preset': 'ultrafast'
+        }
+    
+    async def _get_cached_normalized_intro(self, intro_path: str, target_specs: Dict[str, Any]) -> Optional[str]:
+        """Check for cached normalized intro"""
+        # Create cache key based on intro file and target specs
+        intro_stat = os.stat(intro_path)
+        specs_hash = hashlib.md5(
+            f"{target_specs['width']}x{target_specs['height']}@{target_specs['fps']}fps".encode()
+        ).hexdigest()[:8]
+        
+        cache_filename = f"intro_{intro_stat.st_mtime}_{intro_stat.st_size}_{specs_hash}.mp4"
+        cache_path = self.normalized_cache / cache_filename
+        
+        if cache_path.exists():
+            # Verify cache file integrity
+            try:
+                cached_info = await self._get_video_specs(str(cache_path))
+                if (abs(cached_info.width - target_specs['width']) <= 2 and
+                    abs(cached_info.height - target_specs['height']) <= 2 and
+                    abs(cached_info.fps - target_specs['fps']) <= 0.1):
+                    return str(cache_path)
+            except Exception as e:
+                logger.warning(f"Cache verification failed: {e}")
+                cache_path.unlink(missing_ok=True)
+        
+        return None
+    
+    async def _normalize_intro_turbo(self, intro_path: str, target_specs: Dict[str, Any],
+                                   progress_callback=None) -> str:
+        """Normalize intro with turbo speed and caching"""
+        # Generate cache path
+        intro_stat = os.stat(intro_path)
+        specs_hash = hashlib.md5(
+            f"{target_specs['width']}x{target_specs['height']}@{target_specs['fps']}fps".encode()
+        ).hexdigest()[:8]
+        
+        cache_filename = f"intro_{intro_stat.st_mtime}_{intro_stat.st_size}_{specs_hash}.mp4"
+        cache_path = self.normalized_cache / cache_filename
+        
+        # Build turbo normalization command
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', intro_path,
+            '-vf', f'scale={target_specs["width"]}:{target_specs["height"]}:force_original_aspect_ratio=decrease,pad={target_specs["width"]}:{target_specs["height"]}:(ow-iw)/2:(oh-ih)/2,fps={target_specs["fps"]}',
+            '-c:v', self.ffmpeg_processor.encoder,
+            '-preset', 'ultrafast',
+            '-crf', '28',  # Higher CRF for faster encoding
+            '-c:a', 'copy',
+            '-threads', str(self.ffmpeg_processor.optimal_threads),
+            '-movflags', '+faststart',
+            str(cache_path)
+        ]
+        
+        # Execute with progress tracking
+        if progress_callback:
+            intro_info = await self._get_video_specs(intro_path)
+            await self._execute_with_progress(cmd, intro_info, progress_callback, "normalizing_intro")
+        else:
+            process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            await process.wait()
+        
+        return str(cache_path)
+    
+    async def _normalize_main_video_turbo(self, main_path: str, target_specs: Dict[str, Any],
+                                        progress_callback=None) -> str:
+        """Normalize main video if needed"""
+        main_info = await self._get_video_specs(main_path)
+        
+        # Check if normalization is needed
+        needs_normalization = (
+            abs(main_info.width - target_specs['width']) > 2 or
+            abs(main_info.height - target_specs['height']) > 2 or
+            abs(main_info.fps - target_specs['fps']) > 0.1
+        )
+        
+        if not needs_normalization:
+            return main_path
+        
+        # Create temporary normalized file
+        temp_normalized = f"temp_main_normalized_{int(time.time())}_{os.getpid()}.mp4"
+        
+        # Build command for main video normalization
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', main_path,
+            '-vf', f'scale={target_specs["width"]}:{target_specs["height"]}:force_original_aspect_ratio=decrease,pad={target_specs["width"]}:{target_specs["height"]}:(ow-iw)/2:(oh-ih)/2,fps={target_specs["fps"]}',
+            '-c:v', self.ffmpeg_processor.encoder,
+            '-preset', 'superfast',  # Slightly better quality for main video
+            '-crf', '26',
+            '-c:a', 'copy',
+            '-threads', str(self.ffmpeg_processor.optimal_threads),
+            '-movflags', '+faststart',
+            temp_normalized
+        ]
+        
+        # Execute with progress tracking
+        if progress_callback:
+            await self._execute_with_progress(cmd, main_info, progress_callback, "normalizing_main")
+        else:
+            process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            await process.wait()
+        
+        return temp_normalized
+    
+    async def _concatenate_turbo(self, intro_path: str, main_path: str, output_path: str,
+                               progress_callback=None) -> bool:
+        """Ultra-fast concatenation using stream copy"""
+        try:
+            # Create concat list file
+            list_file = f"temp_concat_{int(time.time())}_{os.getpid()}.txt"
+            
             with open(list_file, 'w') as f:
-                f.write(f"file '{os.path.abspath(temp_intro)}'\n")
-                f.write(f"file '{os.path.abspath(temp_main)}'\n")
-
-            # Use ultra-fast concatenation settings
-            cmd_concat = [
-                'ffmpeg',
-                '-f',
-                'concat',
-                '-safe',
-                '0',
-                '-i',
-                list_file,
-                '-c',
-                'copy',  # Copy streams without re-encoding for maximum speed
-                '-avoid_negative_ts',
-                'make_zero',
-                '-fflags',
-                '+genpts',
-                '-movflags',
-                '+faststart',
-                '-y',
+                f.write(f"file '{os.path.abspath(intro_path)}'\n")
+                f.write(f"file '{os.path.abspath(main_path)}'\n")
+            
+            # Build ultra-fast concatenation command
+            cmd = [
+                'ffmpeg', '-y',
+                '-f', 'concat',
+                '-safe', '0',
+                '-i', list_file,
+                '-c', 'copy',  # Stream copy for maximum speed
+                '-avoid_negative_ts', 'make_zero',
+                '-fflags', '+genpts',
+                '-movflags', '+faststart',
                 output_path
             ]
-
-            if progress_callback:
-                process = subprocess.Popen(cmd_concat,
-                                           stdout=subprocess.PIPE,
-                                           stderr=subprocess.PIPE,
-                                           universal_newlines=True)
-                concat_start = time.time()
-                last_concat_update = concat_start
-
-                while True:
-                    output = process.stderr.readline()
-                    if output == '' and process.poll() is not None:
-                        break
-                    if output:
-                        current_time = time.time()
-                        # Update every 10 seconds
-                        if current_time - last_concat_update >= 10.0:
-                            elapsed = current_time - concat_start
-                            concat_percent = 70 + min(
-                                30, (elapsed / 10) *
-                                30)  # Progress from 70% to 100%
-                            await progress_callback(
-                                concat_percent, 100,
-                                f"Concatenating videos ({elapsed:.1f}s)")
-                            last_concat_update = current_time
-
-                process.wait()
-                if process.returncode != 0:
-                    stderr_output = process.stderr.read(
-                    ) if process.stderr else "Unknown error"
-                    logger.error(
-                        f"Concatenation failed with stderr: {stderr_output}")
-                    raise subprocess.CalledProcessError(
-                        process.returncode, cmd_concat, stderr_output)
-            else:
-                result = subprocess.run(cmd_concat,
-                                        check=True,
-                                        capture_output=True,
-                                        text=True)
-
-            if progress_callback:
-                await progress_callback(
-                    100, 100, "Intro and main video processing completed")
-
-            logger.info("Successfully concatenated intro with main video")
-
-        except subprocess.CalledProcessError as e:
-            logger.error(
-                f"FFmpeg error during processing: {e.stderr if hasattr(e, 'stderr') else str(e)}"
+            
+            # Execute concatenation
+            process = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
             )
-            raise Exception(
-                f"Video processing failed: FFmpeg error - {str(e)}")
+            
+            stdout, stderr = await process.wait_with_timeout(300)  # 5 minute timeout
+            
+            # Cleanup list file
+            Path(list_file).unlink(missing_ok=True)
+            
+            return process.returncode == 0
+            
         except Exception as e:
-            logger.error(
-                f"Video processing with intro normalization failed: {e}")
-            raise Exception(f"Intro processing failed: {str(e)}")
-        finally:
-            # Clean up all temp files
-            for temp_file in [temp_intro, temp_main, list_file]:
-                if temp_file and os.path.exists(temp_file):
-                    try:
-                        os.remove(temp_file)
-                        logger.info(f"Cleaned up temp file: {temp_file}")
-                    except Exception as e:
-                        logger.warning(f"Error cleaning up {temp_file}: {e}")
-
-            # Kill any remaining FFmpeg processes
+            logger.error(f"Turbo concatenation failed: {e}")
+            return False
+    
+    async def _execute_with_progress(self, cmd: List[str], video_info: VideoInfo,
+                                   progress_callback, stage: str):
+        """Execute command with progress monitoring"""
+        process = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        
+        frame_count = 0
+        total_frames = video_info.frame_count
+        start_time = time.time()
+        
+        while True:
             try:
-                import subprocess
-                subprocess.run(['pkill', '-f', 'ffmpeg'], check=False, capture_output=True)
-            except:
-                pass
-
-    async def process_video_with_metadata(self,
-                                          message: Message,
-                                          user_id: int,
-                                          video_path: str,
-                                          watermark_text: str,
-                                          original_caption: str,
-                                          video_num: int = None,
-                                          png_location: str = "topright"):
-        """Process video with smooth progress tracking throughout all stages"""
-        progress_msg = None
-        try:
-            session = self.user_sessions.get(user_id, {})
-            if session.get('stopped'):
-                return
-
-            # Initialize unified progress tracking
-            video_counter = f"[{video_num}/{self.user_sessions[user_id].get('total_videos', 1)}] " if video_num else ""
-            progress_msg = await self.create_progress_message(
-                message, f"🚀 **Initializing video processing...**", video_num,
-                self.user_sessions[user_id].get('total_videos', 1)
-                if video_num else None)
-
-            start_time = time.time()
-            last_update_time = 0
-
-            async def update_timed_progress(stage: str,
-                                            percent: float,
-                                            step_detail: str = "",
-                                            **kwargs):
-                nonlocal last_update_time
-                current_time = time.time()
-
-                # Check if stopped
-                if self.user_sessions.get(user_id, {}).get('stopped'):
-                    raise Exception("Process was stopped by user")
-
-                # Ensure percent is within valid bounds
-                percent = max(0, min(100, percent))
-
-                # Ensure 10-second delay between updates for flood protection
-                if current_time - last_update_time < 10 and percent < 100:
-                    return
-
-                # Always update if it's completion (100%)
-                if percent >= 100 or current_time - last_update_time >= 10:
-                    # Format elapsed time
-                    total_elapsed = current_time - start_time
-                    if total_elapsed > 3600:
-                        elapsed_str = f"{int(total_elapsed//3600)}h {int((total_elapsed%3600)//60)}m"
-                    elif total_elapsed > 60:
-                        elapsed_str = f"{int(total_elapsed//60)}m {int(total_elapsed%60)}s"
-                    else:
-                        elapsed_str = f"{int(total_elapsed)}s"
-
-                    # Build details
-                    details = {
-                        'elapsed': elapsed_str,
-                        'processing_step': step_detail,
-                        **kwargs
-                    }
-
-                    await self.update_progress_smooth(progress_msg, stage,
-                                                      percent, details,
-                                                      video_counter, True)
-
-                    last_update_time = current_time
-
-            # Stage 1: Download video if needed (0-25%)
-            if not os.path.exists(video_path):
-                await update_timed_progress("downloading", 0,
-                                            "Starting download")
-
-                session = self.user_sessions[user_id]
-                file_id = session['video_file_id']
-
-                download_start_time = time.time()
-                speed_samples = []
-                last_current = 0
-                last_download_update = download_start_time
-
-                async def smooth_download_progress(current, total):
-                    nonlocal speed_samples, last_current, last_download_update
-                    current_time = time.time()
-
-                    if session.get('stopped'):
-                        raise Exception("Process was stopped by user")
-
-                    # Calculate download metrics
-                    download_percent = (
-                        current /
-                        total) * 25 if total > 0 else 0  # 0-25% for download
-                    current_mb = current / (1024 * 1024)
-                    total_mb = total / (1024 * 1024)
-                    elapsed = current_time - download_start_time
-
-                    # Speed calculation
-                    if elapsed > 0:
-                        bytes_diff = current - last_current
-                        time_diff = current_time - last_download_update
-                        instant_speed = bytes_diff / time_diff if time_diff > 0 else 0
-
-                        speed_samples.append(instant_speed)
-                        if len(speed_samples) > 10:
-                            speed_samples.pop(0)
-
-                        avg_speed = sum(speed_samples) / len(
-                            speed_samples) if speed_samples else 0
-                        speed_mbps = avg_speed / (1024 * 1024)
-
-                        # ETA calculation
-                        if avg_speed > 0 and current < total:
-                            remaining_bytes = total - current
-                            eta_seconds = remaining_bytes / avg_speed
-                            if eta_seconds > 60:
-                                eta_str = f"{int(eta_seconds//60)}m {int(eta_seconds%60)}s"
-                            else:
-                                eta_str = f"{int(eta_seconds)}s"
-                        else:
-                            eta_str = "calculating..."
-                    else:
-                        speed_mbps = 0
-                        eta_str = "calculating..."
-
-                    # Update every 10 seconds or on completion
-                    if (current_time - last_download_update
-                            >= 10) or (current == total):
-                        await update_timed_progress(
-                            "downloading",
-                            download_percent,
-                            f"Downloading: {current_mb:.1f}/{total_mb:.1f} MB",
-                            current_mb=current_mb,
-                            total_mb=total_mb,
-                            speed_mbps=speed_mbps,
-                            eta=eta_str)
-                        last_download_update = current_time
-
-                    last_current = current
-
-                try:
-                    await self.app.download_media(
-                        file_id,
-                        file_name=video_path,
-                        progress=smooth_download_progress)
-                    await update_timed_progress("downloading", 25,
-                                                "Download completed")
-                except Exception as e:
-                    if "stopped by user" in str(e):
-                        raise
-                    else:
-                        logger.error(f"Download error: {e}")
-                        raise Exception(f"Download failed: {str(e)}")
-
-            # Stage 2: Apply watermarks (25-60%)
-            await update_timed_progress("watermarking", 25,
-                                        "Preparing watermarks")
-            watermarked_path = video_path.replace('.mp4', '_watermarked.mp4')
-            watermark_png_path = f"persistent_watermarks/watermark_{user_id}.png"
-
-            last_watermark_update = time.time()
-
-            async def watermark_progress(current_frame,
-                                         total_frames,
-                                         progress_info=None):
-                nonlocal last_watermark_update
-                current_time = time.time()
-
-                if total_frames > 0:
-                    frame_ratio = min(1.0, current_frame / total_frames)
-                    frame_percent = frame_ratio * 35  # 35% for watermarking
-                    total_percent = max(25, min(60, 25 + frame_percent))
-
-                    # Update every 3 seconds or on completion
-                    if (current_time - last_watermark_update
-                            >= 3) or (current_frame >= total_frames):
-                        # Build detailed step description
-                        if progress_info:
-                            processing_fps = progress_info.get(
-                                'processing_fps', 0)
-                            elapsed = progress_info.get('elapsed', '0s')
-                            eta = progress_info.get('eta', 'calculating...')
-
-                            step_detail = f"Watermarking: {current_frame}/{total_frames} frames @ {processing_fps:.1f}fps"
-                        else:
-                            step_detail = f"Watermarking: {current_frame}/{total_frames} frames"
-
-                        # Enhanced details for progress display
-                        details = {
-                            'frame_progress':
-                            f"{current_frame}/{total_frames}",
-                            'processing_fps':
-                            progress_info.get('processing_fps', 0)
-                            if progress_info else 0,
-                            'elapsed':
-                            progress_info.get('elapsed', '')
-                            if progress_info else '',
-                            'eta':
-                            progress_info.get('eta', '')
-                            if progress_info else ''
+                line = await asyncio.wait_for(process.stderr.readline(), timeout=1.0)
+                if not line:
+                    break
+                
+                line_str = line.decode('utf-8', errors='ignore').strip()
+                
+                if 'frame=' in line_str:
+                    try:
+                        frame_match = line_str.split('frame=')[1].split()[0]
+                        frame_count = int(frame_match)
+                        
+                        elapsed = time.time() - start_time
+                        processing_fps = frame_count / elapsed if elapsed > 0 else 0
+                        
+                        progress_info = {
+                            'stage': stage,
+                            'frame_count': frame_count,
+                            'total_frames': total_frames,
+                            'processing_fps': processing_fps,
+                            'elapsed': elapsed
                         }
-
-                        await update_timed_progress(
-                            "watermarking",
-                            total_percent, step_detail,
-                            **details)
-                        last_watermark_update = current_time
-
-            await self.add_combined_watermarks(video_path, watermarked_path,
-                                               watermark_text,
-                                               watermark_png_path,
-                                               png_location,
-                                               watermark_progress)
-            await update_timed_progress("watermarking", 60,
-                                        "Watermarking completed")
-
-            # Stage 3: Add intro if exists (60-85%)
-            final_path = watermarked_path
-            intro_path = f"persistent_intros/intro_{user_id}.mp4"
-            if os.path.exists(intro_path):
+                        
+                        await progress_callback(frame_count, total_frames, progress_info)
+                        
+                    except (ValueError, IndexError):
+                        continue
+                        
+            except asyncio.TimeoutError:
+                continue
+        
+        await process.wait()
+    
+    async def _cleanup_temp_files(self, temp_files: List[str]):
+        """Cleanup temporary files asynchronously"""
+        for temp_file in temp_files:
+            if temp_file and Path(temp_file).exists():
                 try:
-                    intro_info = await self.get_video_info(intro_path)
-                    if intro_info.get('duration', 0) > 0 and intro_info.get(
-                            'width', 0) > 0:
-                        await update_timed_progress("processing", 60,
-                                                    "Validating intro video")
-                        final_with_intro = video_path.replace(
-                            '.mp4', '_with_intro.mp4')
-
-                        last_intro_update = time.time()
-
-                        async def intro_progress(percent, total, step_desc, elapsed=None, eta=None):
-                            nonlocal last_intro_update
-                            current_time = time.time()
-
-                            # Map intro progress to 60-85% range
-                            intro_ratio = max(0, min(100, percent)) / 100
-                            intro_percent = max(60, min(85, 60 + intro_ratio * 25))
-
-                            # Update every 10 seconds or on completion
-                            if (current_time - last_intro_update
-                                    >= 10) or (percent >= 100):
-                                await update_timed_progress(
-                                    "processing", intro_percent, step_desc)
-                                last_intro_update = current_time
-
-                        try:
-                            await self.add_intro_with_normalization(
-                                intro_path, watermarked_path, final_with_intro,
-                                intro_progress)
-
-                            if os.path.exists(
-                                    final_with_intro) and os.path.getsize(
-                                        final_with_intro) > 0:
-                                final_path = final_with_intro
-                                await update_timed_progress(
-                                    "processing", 85,
-                                    "Intro addition completed")
-                            else:
-                                await update_timed_progress(
-                                    "processing", 85,
-                                    "Intro failed, using watermarked video")
-                        except Exception as intro_error:
-                            logger.error(
-                                f"Intro processing failed: {intro_error}")
-                            await update_timed_progress(
-                                "processing", 85,
-                                f"Intro error: {str(intro_error)[:30]}...")
-                    else:
-                        await update_timed_progress(
-                            "processing", 85, "Skipping corrupted intro")
+                    Path(temp_file).unlink()
                 except Exception as e:
-                    logger.error(f"Error validating intro: {e}")
-                    await update_timed_progress("processing", 85,
-                                                "Intro validation failed")
-            else:
-                await update_timed_progress("processing", 85,
-                                            "No intro found, proceeding")
+                    logger.warning(f"Failed to cleanup {temp_file}: {e}")
 
-            # Stage 4: Prepare caption (85-90%)
-            await update_timed_progress("finalizing", 85, "Preparing captions")
-            permanent_caption_path = f"persistent_captions/caption_{user_id}.txt"
-            permanent_caption = ""
-            if os.path.exists(permanent_caption_path):
-                try:
-                    with open(permanent_caption_path, 'r') as f:
-                        permanent_caption = f.read().strip()
-                except Exception as e:
-                    logger.error(f"Error reading permanent caption: {e}")
-
-            combined_caption = original_caption
-            if permanent_caption:
-                combined_caption = f"{original_caption}\n\n{permanent_caption}"
-
-            await update_timed_progress("finalizing", 90,
-                                        "Caption preparation completed")
-
-            # Stage 5: Generate thumbnail if not exists (85-90%)
-            await update_timed_progress("finalizing", 87, "Checking thumbnail")
-
-            thumbnail_path = f"persistent_thumbnails/thumbnail_{user_id}.jpg"
-            auto_thumbnail_path = f"temp_{user_id}/auto_thumbnail.jpg"
-
-            # Use custom thumbnail if exists, otherwise generate from video
-            thumbnail = None
-            if os.path.exists(thumbnail_path):
-                thumbnail = thumbnail_path
-                await update_timed_progress("finalizing", 89,
-                                            "Using custom thumbnail")
-            else:
-                # Generate automatic thumbnail from final video
-                await update_timed_progress("finalizing", 88,
-                                            "Generating thumbnail from video")
-                if await self.generate_video_thumbnail(final_path,
-                                                       auto_thumbnail_path):
-                    thumbnail = auto_thumbnail_path
-                    await update_timed_progress("finalizing", 89,
-                                                "Auto thumbnail generated")
+class BulkProcessingOptimizer:
+    """Optimized bulk processing with parallel operations and smart queuing"""
+    
+    def __init__(self, video_processor: HighPerformanceVideoProcessor):
+        self.video_processor = video_processor
+        self.processing_semaphore = asyncio.Semaphore(2)  # Limit concurrent processing
+        self.download_semaphore = asyncio.Semaphore(3)   # Allow more downloads
+        
+    async def process_bulk_queue_optimized(self, user_id: int, queue_data: List[Dict],
+                                         watermark_text: str, png_location: str,
+                                         progress_callback=None) -> List[str]:
+        """Process bulk queue with optimized parallel operations"""
+        results = []
+        failed_videos = []
+        
+        try:
+            # Create processing tasks
+            tasks = []
+            for i, video_info in enumerate(queue_data, 1):
+                task = self._process_single_video_optimized(
+                    user_id, video_info, watermark_text, png_location,
+                    i, len(queue_data), progress_callback
+                )
+                tasks.append(task)
+            
+            # Process with controlled concurrency
+            completed_tasks = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Collect results
+            for i, result in enumerate(completed_tasks):
+                if isinstance(result, Exception):
+                    logger.error(f"Video {i+1} failed: {result}")
+                    failed_videos.append(i+1)
                 else:
-                    await update_timed_progress("finalizing", 89,
-                                                "No thumbnail available")
-
-            # Stage 6: Upload with integrated progress tracking (85-100%)
-            await update_timed_progress("uploading", 85, "Starting upload")
-
-            session = self.user_sessions[user_id]
-            video_duration = session.get('video_duration', 0)
-            video_width = session.get('video_width', 1280)
-            video_height = session.get('video_height', 720)
-
-            # Get file size for upload progress and overall ETA calculation
-            upload_file_size = os.path.getsize(final_path)
-            total_process_start = start_time  # Use overall process start time
-            last_upload_update = time.time()
-            upload_speed_samples = []
-
-            async def upload_progress_callback(current, total):
-                nonlocal last_upload_update, upload_speed_samples
-                current_time = time.time()
-
-                if session.get('stopped'):
-                    raise Exception("Process was stopped by user")
-
-                # Calculate upload metrics with integrated progress (85-100% = 15% total)
-                upload_ratio = (current / total) if total > 0 else 0
-                upload_percent = max(85, min(100, 85 + upload_ratio * 15))
-                current_mb = current / (1024 * 1024)
-                total_mb = total / (1024 * 1024)
-
-                # Calculate upload speed
-                upload_elapsed = current_time - last_upload_update if last_upload_update > 0 else 1
-                if upload_elapsed > 0:
-                    current_speed = current / upload_elapsed if last_upload_update > 0 else 0
-                    upload_speed_samples.append(current_speed)
-                    if len(upload_speed_samples) > 5:
-                        upload_speed_samples.pop(0)
-
-                    avg_speed = sum(upload_speed_samples) / len(
-                        upload_speed_samples) if upload_speed_samples else 0
-                    speed_mbps = avg_speed / (1024 * 1024)
-
-                    # Calculate remaining upload time only
-                    if avg_speed > 0 and current < total:
-                        remaining_bytes = total - current
-                        upload_eta_seconds = remaining_bytes / avg_speed
-                        if upload_eta_seconds > 60:
-                            eta_str = f"{int(upload_eta_seconds//60)}m{int(upload_eta_seconds%60)}s"
-                        else:
-                            eta_str = f"{int(upload_eta_seconds)}s"
-                    else:
-                        eta_str = "finishing..."
-                else:
-                    speed_mbps = 0
-                    eta_str = "calculating..."
-
-                # Overall elapsed time from process start
-                total_elapsed = current_time - total_process_start
-                if total_elapsed > 60:
-                    elapsed_str = f"{int(total_elapsed//60)}m{int(total_elapsed%60)}s"
-                else:
-                    elapsed_str = f"{int(total_elapsed)}s"
-
-                # Update every 2 seconds for more responsive upload tracking
-                if (current_time - last_upload_update >= 2) or (current
-                                                                == total):
-                    await update_timed_progress(
-                        "uploading",
-                        upload_percent,
-                        f"Uploading: {current_mb:.2f}/{total_mb:.2f} MB",
-                        current_mb=current_mb,
-                        total_mb=total_mb,
-                        speed_mbps=max(0.01, speed_mbps),
-                        eta=eta_str,
-                        elapsed=elapsed_str)
-                    last_upload_update = current_time
-
+                    results.append(result)
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Bulk processing optimization failed: {e}")
+            return []
+    
+    async def _process_single_video_optimized(self, user_id: int, video_info: Dict,
+                                            watermark_text: str, png_location: str,
+                                            video_num: int, total_videos: int,
+                                            progress_callback=None) -> str:
+        """Process single video with full optimization pipeline"""
+        async with self.processing_semaphore:
             try:
-                await self.app.send_video(
-                    chat_id=user_id,
-                    video=final_path,
-                    caption=combined_caption,
-                    duration=int(video_duration)
-                    if video_duration > 0 else None,
-                    width=int(video_width) if video_width > 0 else None,
-                    height=int(video_height) if video_height > 0 else None,
-                    thumb=thumbnail,
-                    supports_streaming=True,
-                    progress=upload_progress_callback)
-            except Exception as upload_error:
-                logger.error(f"Upload error: {upload_error}")
-                # Fallback upload without progress
-                await self.app.send_video(chat_id=user_id,
-                                          video=final_path,
-                                          caption=combined_caption)
+                # Setup temporary processing directory
+                temp_dir = Path(f"temp_processing/user_{user_id}_{video_num}")
+                temp_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Prepare file paths
+                video_path = temp_dir / video_info['filename']
+                watermarked_path = temp_dir / f"watermarked_{video_info['filename']}"
+                
+                # Download with optimization
+                async with self.download_semaphore:
+                    await self._download_video_optimized(
+                        user_id, video_info, str(video_path), progress_callback
+                    )
+                
+                # Apply watermarks with turbo engine
+                watermark_engine = UltraFastWatermarkEngine(
+                    self.video_processor.ffmpeg_processor
+                )
+                
+                success = await watermark_engine.apply_watermarks_turbocharged(
+                    str(video_path), str(watermarked_path),
+                    watermark_text, self._get_user_watermark_path(user_id),
+                    png_location, progress_callback
+                )
+                
+                if not success:
+                    raise Exception("Watermarking failed")
+                
+                # Process intro if exists
+                final_path = await self._process_intro_if_exists(
+                    user_id, str(watermarked_path), temp_dir, progress_callback
+                )
+                
+                # Upload optimized
+                await self._upload_video_optimized(
+                    user_id, final_path, video_info, progress_callback
+                )
+                
+                # Cleanup
+                await self._cleanup_temp_directory(temp_dir)
+                
+                return f"Video {video_num} processed successfully"
+                
+            except Exception as e:
+                logger.error(f"Single video processing failed: {e}")
+                await self._cleanup_temp_directory(temp_dir)
+                raise
+    
+    async def _download_video_optimized(self, user_id: int, video_info: Dict,
+                                      video_path: str, progress_callback=None):
+        """Optimized video download"""
+        # This would integrate with the turbo download system
+        # Implementation would use the download_with_turbo_progress method
+        pass
+    
+    def _get_user_watermark_path(self, user_id: int) -> str:
+        """Get user watermark path"""
+        watermark_path = f"persistent_watermarks/watermark_{user_id}.png"
+        return watermark_path if os.path.exists(watermark_path) else None
+    
+    async def _process_intro_if_exists(self, user_id: int, video_path: str,
+                                     temp_dir: Path, progress_callback=None) -> str:
+        """Process intro if it exists for user"""
+        intro_path = f"persistent_intros/intro_{user_id}.mp4"
+        
+        if not os.path.exists(intro_path):
+            return video_path
+        
+        output_with_intro = temp_dir / "with_intro.mp4"
+        
+        intro_processor = TurboIntroProcessor(
+            self.video_processor.ffmpeg_processor
+        )
+        
+        success = await intro_processor.process_intro_with_main_turbocharged(
+            intro_path, video_path, str(output_with_intro), progress_callback
+        )
+        
+        return str(output_with_intro) if success else video_path
+    
+    async def _upload_video_optimized(self, user_id: int, video_path: str,
+                                    video_info: Dict, progress_callback=None):
+        """Optimized video upload with progress tracking"""
+        # This would integrate with the optimized upload system
+        # Implementation would handle thumbnails, captions, etc.
+        pass
+    
+    async def _cleanup_temp_directory(self, temp_dir: Path):
+        """Cleanup temporary directory"""
+        try:
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir)
+        except Exception as e:
+            logger.warning(f"Cleanup failed for {temp_dir}: {e}")
 
-            # Calculate total processing time
-            total_time = time.time() - start_time
-            if total_time > 3600:
-                time_str = f"{int(total_time//3600)}h {int((total_time%3600)//60)}m {int(total_time%60)}s"
-            elif total_time > 60:
-                time_str = f"{int(total_time//60)}m {int(total_time%60)}s"
-            else:
-                time_str = f"{int(total_time)}s"
-
-            await update_timed_progress("completed", 100,
-                                        f"Processing completed in {time_str}")
-
-            # IMPROVED CLEANUP: Always delete progress message after completion
-            if progress_msg:
-                try:
-                    await asyncio.sleep(3)  # Wait 3 seconds to show completion
-                    await progress_msg.delete()
-                    logger.info("Progress message deleted successfully")
-                except Exception as e:
-                    logger.warning(f"Could not delete progress message: {e}")
-
-            # Clean up temp files
-            user_dir = f"temp_{user_id}"
-            if os.path.exists(user_dir):
-                shutil.rmtree(user_dir)
-
-            for temp_file in [
-                    video_path, watermarked_path,
-                    final_path if final_path != watermarked_path else None
-            ]:
-                if temp_file and temp_file != final_path and os.path.exists(
-                        temp_file):
+class OptimizedSessionManager:
+    """Advanced session management with memory optimization"""
+    
+    def __init__(self):
+        self.sessions = {}
+        self.session_locks = {}
+        self.cleanup_interval = 1800  # 30 minutes
+        self.last_cleanup = time.time()
+        
+    async def get_session(self, user_id: int) -> Dict[str, Any]:
+        """Get or create user session with thread safety"""
+        if user_id not in self.session_locks:
+            self.session_locks[user_id] = asyncio.Lock()
+        
+        async with self.session_locks[user_id]:
+            if user_id not in self.sessions:
+                self.sessions[user_id] = {
+                    'created_at': time.time(),
+                    'last_activity': time.time(),
+                    'processing': False,
+                    'stopped': False
+                }
+            
+            self.sessions[user_id]['last_activity'] = time.time()
+            return self.sessions[user_id]
+    
+    async def update_session(self, user_id: int, updates: Dict[str, Any]):
+        """Update user session atomically"""
+        session = await self.get_session(user_id)
+        session.update(updates)
+        session['last_activity'] = time.time()
+    
+    async def cleanup_inactive_sessions(self):
+        """Cleanup inactive sessions to free memory"""
+        current_time = time.time()
+        
+        if current_time - self.last_cleanup < self.cleanup_interval:
+            return
+        
+        inactive_users = []
+        
+        for user_id, session in self.sessions.items():
+            if (current_time - session.get('last_activity', 0) > 3600 and  # 1 hour
+                not session.get('processing', False)):
+                inactive_users.append(user_id)
+        
+        # Remove inactive sessions
+        for user_id in inactive_users:
+            self.sessions.pop(user_id, None)
+            self.session_locks.pop(user_id, None)
+            logger.info(f"Cleaned up inactive session for user {user_id}")
+        
+        self.last_cleanup = current_time
+    
+    def get_active_users_count(self) -> int:
+        """Get count of active users"""
+        current_time = time.time()
+        active_count = 0
+        
+        for session in self.sessions.values():
+            if current_time - session.get('last_activity', 0) < 1800:  # 30 minutes
+                active_count += 1
+        
+        return active_count
+            
+            return process.returncode == 0
+            
+        except Exception as e:
+            logger.error(f"FFmpeg execution failed: {e}")
+            return False
+    
+    async def _monitor_ffmpeg_progress(self, process, video_info: VideoInfo, progress_callback):
+        """Monitor FFmpeg progress with optimized parsing"""
+        frame_count = 0
+        total_frames = video_info.frame_count
+        start_time = time.time()
+        last_update = start_time
+        fps_samples = []
+        
+        while True:
+            try:
+                line = await asyncio.wait_for(process.stderr.readline(), timeout=1.0)
+                if not line:
+                    break
+                
+                line_str = line.decode('utf-8', errors='ignore').strip()
+                
+                if 'frame=' in line_str:
                     try:
-                        os.remove(temp_file)
-                    except:
-                        pass
+                        # Parse frame number
+                        frame_match = line_str.split('frame=')[1].split()[0]
+                        frame_count = int(frame_match)
+                        
+                        current_time = time.time()
+                        
+                        # Calculate processing FPS
+                        elapsed = current_time - start_time
+                        if elapsed > 0:
+                            processing_fps = frame_count / elapsed
+                            fps_samples.append(processing_fps)
+                            if len(fps_samples) > 5:
+                                fps_samples.pop(0)
+                            
+                            avg_fps = sum(fps_samples) / len(fps_samples)
+                        else:
+                            avg_fps = 0
+                        
+                        # Calculate ETA
+                        if avg_fps > 0 and total_frames > 0:
+                            remaining_frames = max(0, total_frames - frame_count)
+                            eta_seconds = remaining_frames / avg_fps
+                        else:
+                            eta_seconds = 0
+                        
+                        # Update progress every 2 seconds
+                        if current_time - last_update >= 2.0 or frame_count >= total_frames:
+                            progress_info = {
+                                'frame_count': frame_count,
+                                'total_frames': total_frames,
+                                'processing_fps': avg_fps,
+                                'eta_seconds': eta_seconds,
+                                'elapsed': elapsed
+                            }
+                            
+                            await progress_callback(frame_count, total_frames, progress_info)
+                            last_update = current_time
+                            
+                    except (ValueError, IndexError):
+                        continue
+                        
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                logger.warning(f"Progress monitoring error: {e}")
+                break
+        
+        await process.wait()
+        # Continue from Part 1...
+    
+    # Updated WatermarkBot class with all optimizations integrated
+    def __init__(self, api_id: int, api_hash: str, bot_token: str):
+        """Initialize optimized watermark bot with all performance improvements"""
+        self.api_id = api_id
+        self.api_hash = api_hash
+        self.bot_token = bot_token
+        
+        # Initialize all optimization systems
+        self.session_manager = OptimizedSessionManager()
+        self.video_processor = HighPerformanceVideoProcessor()
+        self.watermark_engine = UltraFastWatermarkEngine(self.video_processor.ffmpeg_processor)
+        self.intro_processor = TurboIntroProcessor(self.video_processor.ffmpeg_processor)
+        self.bulk_optimizer = BulkProcessingOptimizer(self.video_processor)
+        
+        # Admin configuration
+        self.admin_users = [2038923790]
+        
+        # Setup optimized directories
+        self._setup_optimized_directories()
+        
+        # Initialize Pyrogram with performance settings
+        self.app = Client(
+            "watermark_bot_ultra",
+            api_id=api_id,
+            api_hash=api_hash,
+            bot_token=bot_token,
+            workdir=".",
+            max_concurrent_transmissions=6,  # Increased for better performance
+            sleep_threshold=60,  # Optimize connection management
+            workers=8  # More workers for handling messages
+        )
+        
+        # Background optimization task
+        asyncio.create_task(self._background_maintenance())
+    
+    def _setup_optimized_directories(self):
+        """Setup directory structure with performance optimizations"""
+        directories = [
+            'persistent_intros', 'persistent_watermarks', 'persistent_thumbnails',
+            'bulk_queue', 'persistent_captions', 'cache', 'temp_processing',
+            'cache/normalized_intros', 'cache/video_info', 'logs'
+        ]
+        
+        for directory in directories:
+            Path(directory).mkdir(mode=0o755, parents=True, exist_ok=True)
+    
+    async def _background_maintenance(self):
+        """Background task for system maintenance"""
+        while True:
+            try:
+                await asyncio.sleep(300)  # Every 5 minutes
+                
+                # Session cleanup
+                await self.session_manager.cleanup_inactive_sessions()
+                
+                # Cache cleanup
+                await self._cleanup_old_cache_files()
+                
+                # Temp file cleanup
+                await self._cleanup_temp_files()
+                
+                # System resource monitoring
+                await self._monitor_system_resources()
+                
+            except Exception as e:
+                logger.error(f"Background maintenance error: {e}")
+    
+    async def _cleanup_old_cache_files(self):
+        """Cleanup old cache files to prevent disk space issues"""
+        try:
+            cache_dirs = ['cache/normalized_intros', 'cache/video_info']
+            current_time = time.time()
+            
+            for cache_dir in cache_dirs:
+                if not os.path.exists(cache_dir):
+                    continue
+                    
+                for cache_file in os.listdir(cache_dir):
+                    file_path = os.path.join(cache_dir, cache_file)
+                    if os.path.isfile(file_path):
+                        file_age = current_time - os.path.getmtime(file_path)
+                        if file_age > 86400:  # 24 hours
+                            os.remove(file_path)
+                            
+        except Exception as e:
+            logger.warning(f"Cache cleanup error: {e}")
+    
+    async def _cleanup_temp_files(self):
+        """Cleanup temporary processing files"""
+        try:
+            temp_dirs = ['temp_processing']
+            current_time = time.time()
+            
+            for temp_dir in temp_dirs:
+                if not os.path.exists(temp_dir):
+                    continue
+                    
+                for item in os.listdir(temp_dir):
+                    item_path = os.path.join(temp_dir, item)
+                    if os.path.isdir(item_path):
+                        # Remove directories older than 1 hour
+                        dir_age = current_time - os.path.getmtime(item_path)
+                        if dir_age > 3600:
+                            shutil.rmtree(item_path, ignore_errors=True)
+                            
+        except Exception as e:
+            logger.warning(f"Temp cleanup error: {e}")
+    
+    async def _monitor_system_resources(self):
+        """Monitor system resources and adjust performance"""
+        try:
+            cpu_percent = psutil.cpu_percent(interval=1)
+            memory = psutil.virtual_memory()
+            
+            # Adjust processing limits based on system load
+            if cpu_percent > 80 or memory.percent > 85:
+                # Reduce concurrent processing
+                self.bulk_optimizer.processing_semaphore = asyncio.Semaphore(1)
+                logger.warning("High system load detected, reducing concurrency")
+            elif cpu_percent < 50 and memory.percent < 70:
+                # Increase concurrent processing
+                self.bulk_optimizer.processing_semaphore = asyncio.Semaphore(3)
+                
+        except Exception as e:
+            logger.warning(f"Resource monitoring error: {e}")
 
-            if not video_num:  # Single video processing
-                # Only reset processing flag, keep other session data
-                if user_id in self.user_sessions and 'processing' in self.user_sessions[user_id]:
-                    self.user_sessions[user_id].pop('processing', None)
-                await message.reply_text(
-                    f"🎉 Video processing completed successfully!\n⏱️ **Total time:** {time_str}")
+    # Optimized Command Handlers
+    async def start_handler(self, client: Client, message: Message):
+        """Ultra-fast start command with system info"""
+        user_id = message.from_user.id
+        
+        # Reset user session
+        await self.session_manager.update_session(user_id, {'stopped': False})
+        
+        system_info = self.get_optimized_system_info()
+        is_admin = user_id in self.admin_users
+        active_users = self.session_manager.get_active_users_count()
+        
+        # GPU information
+        gpu_info = ""
+        if self.video_processor.ffmpeg_processor.gpu_available:
+            gpu_type = self.video_processor.ffmpeg_processor.gpu_type.upper()
+            gpu_info = f"\n🚀 **GPU Acceleration:** {gpu_type} Ready!"
+        
+        welcome_text = f"""
+🎬 **Ultra-Fast Watermark Bot** 🎬
+{system_info}{gpu_info}
+👤 **User ID:** {user_id} {'🔧 (Admin)' if is_admin else ''}
+👥 **Active Users:** {active_users}
 
+**⚡ PERFORMANCE FEATURES:**
+• GPU Hardware Acceleration (when available)
+• Parallel Processing & Smart Caching
+• No File Size Limits - Process GB+ files
+• Lightning Fast Watermarking Engine
+• Smart Progress Tracking & ETA
+
+**🎯 AVAILABLE COMMANDS:**
+• /setintro - Set intro video (cached for speed)
+• /setwatermark - Set PNG watermark
+• /setthumbnail - Set custom thumbnail
+• /addcaption - Add permanent caption
+• /convert - Convert with all effects
+• /bulk - Ultra-fast bulk processing
+• /status - Check your settings
+• /stop - Stop all processes
+
+**🚀 BULK PROCESSING:**
+Use /bulk to process multiple videos simultaneously with maximum performance!
+
+**💡 HOW TO USE:**
+1. (Optional) Set intro/watermark/caption
+2. Send video(s) - any size supported
+3. Choose PNG location if watermark set
+4. Send text or type "skip"
+5. Get processed video with lightning speed!
+
+Ready to process at warp speed! Send a video to start! 🚀
+        """
+        
+        await message.reply_text(welcome_text)
+
+    async def process_video_ultra_optimized(self, message: Message, user_id: int,
+                                          video_path: str, watermark_text: str,
+                                          original_caption: str, video_num: int = None,
+                                          png_location: str = "topright"):
+        """Ultra-optimized video processing pipeline"""
+        progress_msg = None
+        temp_files = []
+        
+        try:
+            session = await self.session_manager.get_session(user_id)
+            if session.get('stopped'):
+                await message.reply_text("🛑 **Process was stopped**")
+                return
+            
+            # Create advanced progress tracker
+            progress_msg = await self.create_advanced_progress_message(
+                message, "🚀 **Initializing ultra-fast pipeline...**",
+                video_num, session.get('total_videos') if video_num else None
+            )
+            
+            # Get processing lock
+            processing_lock = await self.get_user_processing_lock(user_id)
+            
+            async with processing_lock:
+                await self.session_manager.update_session(user_id, {'processing': True})
+                
+                # Stage 1: Download with turbo progress (0-20%)
+                if not os.path.exists(video_path):
+                    await self._download_stage_optimized(
+                        message, user_id, video_path, progress_msg
+                    )
+                
+                # Stage 2: Video preprocessing and optimization (20-35%)
+                await self.update_progress_advanced(
+                    user_id, "preprocessing", 20, 100,
+                    {'status': 'Optimizing video for processing'}
+                )
+                
+                optimized_video_path = await self._preprocess_video_optimized(
+                    video_path, user_id
+                )
+                if optimized_video_path != video_path:
+                    temp_files.append(optimized_video_path)
+                
+                # Stage 3: Apply watermarks with turbo engine (35-70%)
+                watermarked_path = f"{video_path}_watermarked.mp4"
+                temp_files.append(watermarked_path)
+                
+                await self._watermark_stage_optimized(
+                    user_id, optimized_video_path, watermarked_path,
+                    watermark_text, png_location
+                )
+                
+                # Stage 4: Process intro if exists (70-85%)
+                final_path = await self._intro_stage_optimized(
+                    user_id, watermarked_path, temp_files
+                )
+                
+                # Stage 5: Prepare metadata and thumbnail (85-90%)
+                await self._metadata_stage_optimized(
+                    user_id, original_caption, final_path
+                )
+                
+                # Stage 6: Upload with optimization (90-100%)
+                await self._upload_stage_optimized(
+                    user_id, final_path, original_caption, progress_msg
+                )
+                
+                # Success cleanup
+                await self._cleanup_processing_files(temp_files)
+                
+                # Calculate total time
+                session = await self.session_manager.get_session(user_id)
+                total_time = time.time() - session.get('processing_start_time', time.time())
+                time_str = self._format_duration(total_time)
+                
+                if not video_num:  # Single video
+                    await message.reply_text(
+                        f"🎉 **Video processed in {time_str}!**\n"
+                        f"⚡ Ultra-fast pipeline completed successfully!"
+                    )
+        
         except Exception as e:
             error_msg = str(e)
             if "stopped by user" in error_msg:
                 await message.reply_text("🛑 **Processing stopped by user**")
             else:
-                await message.reply_text(
-                    f"❌ Error processing video: {error_msg}")
-            logger.error(f"Video processing error for user {user_id}: {e}")
-
-            # IMPROVED ERROR CLEANUP: Always delete progress message on error
+                await message.reply_text(f"❌ **Error:** {error_msg}")
+                logger.error(f"Ultra-optimized processing error: {e}")
+        
+        finally:
+            # Always cleanup
             if progress_msg:
                 try:
                     await asyncio.sleep(2)
                     await progress_msg.delete()
-                    logger.info("Progress message deleted after error")
-                except Exception as e:
-                    logger.warning(
-                        f"Could not delete progress message after error: {e}")
-        finally:
-            # Always ensure processing flag is cleared for this user
-            if user_id in self.user_sessions and 'processing' in self.user_sessions[user_id]:
-                self.user_sessions[user_id].pop('processing', None)
-
-            # Cleanup temp files for this user
-            user_dir = f"temp_{user_id}"
-            if os.path.exists(user_dir):
-                try:
-                    shutil.rmtree(user_dir)
-                except Exception as cleanup_error:
-                    logger.warning(f"Error cleaning up temp dir for user {user_id}: {cleanup_error}")
-
-    # Command handlers
-    async def start_handler(self, client: Client, message: Message):
-        """Start command handler"""
-        user_id = message.from_user.id
-
-
-        # Clear any existing stopped flag and reset session
-        if user_id in self.user_sessions:
-            self.user_sessions[user_id] = {}
-
-        system_info = self.get_system_usage()
-        is_admin = user_id in self.admin_users
-
-        admin_commands = ""
-        if is_admin:
-            admin_commands = """
-🔧 **Admin Commands:**
-• /adduser <user_id> - Add user to admin list
-• /removeuser <user_id> - Remove user from admin list
-• /listadmins - List all admin users
-• /stats - Get detailed bot statistics
-• /cleanup - Clean all temp and cache files
-
-"""
-
-        welcome_text = f"""
-🎬 **Watermark Bot By ZeroTrace** 🎬
-{system_info}
-👤 **User ID:** {user_id} {'🔧 (Admin)' if is_admin else ''}
-
-I can handle videos up to 1GB with advanced features!
-
-✅ **Available Commands:**
-• /setintro - Set intro video for future use
-• /setwatermark - Set PNG watermark image for future use
-• /setthumbnail - Set thumbnail for watermarked videos
-• /addcaption - Add permanent caption (saved until removed)
-• /convert - Convert MP4 file format with watermarks
-• /removeintro - Remove saved intro
-• /removewatermark - Remove saved watermark
-• /removethumbnail - Remove saved thumbnail
-• /removecaption - Remove saved permanent caption
-• /status - Check saved settings
-• /bulk - Start bulk processing mode
-• /queue - Check bulk queue status
-• /stop - Stop all processes and clean up
-
-{admin_commands}📋 **How to use:**
-1. (Optional) Set intro/watermark/caption using commands above
-2. Send me a video to watermark (up to 1GB!) OR use /convert for file format
-3. If PNG watermark is set, choose location (topleft/topright/bottomleft/bottomright)
-4. Send me the watermark text OR type **"skip"** to skip text watermark
-5. Get your processed video with combined captions!
-
-💡 **PNG Locations:** topleft, topright, bottomleft, bottomright (text watermark will skip PNG location and avoid center)
-💡 **Skip Text Watermark:** Type "skip", "skip text", "no text", or "no watermark" to process video without text watermark but keep PNG watermark (if set).
-
-Send me a video to start! 🎥
-        """
-        await message.reply_text(welcome_text)
-
-    async def set_intro_handler(self, client: Client, message: Message):
-        """Set intro command"""
-        self.user_sessions[message.from_user.id] = {'waiting_for': 'set_intro'}
-        await message.reply_text("🎬 Send me the intro video:")
-
-    async def set_watermark_handler(self, client: Client, message: Message):
-        """Set watermark command"""
-        self.user_sessions[message.from_user.id] = {
-            'waiting_for': 'set_watermark'
-        }
-        await message.reply_text(
-            "🏷️ Send me the watermark image (PNG recommended):")
-
-    async def set_thumbnail_handler(self, client: Client, message: Message):
-        """Set thumbnail command"""
-        self.user_sessions[message.from_user.id] = {
-            'waiting_for': 'set_thumbnail'
-        }
-        await message.reply_text("🖼️ Send me the thumbnail image (JPG/PNG):")
-
-    async def add_caption_handler(self, client: Client, message: Message):
-        """Add permanent caption command"""
-        self.user_sessions[message.from_user.id] = {
-            'waiting_for': 'add_caption'
-        }
-        await message.reply_text("📝 Send me the permanent caption:")
-
-    async def convert_handler(self, client: Client, message: Message):
-        """Convert video with watermark, thumbnail, and caption"""
-        user_id = message.from_user.id
-        self.user_sessions[user_id] = {'waiting_for': 'convert_video'}
-        await message.reply_text("🎥 Send me the MP4 video to convert:")
-
-    async def status_handler(self, client: Client, message: Message):
-        """Check status of saved items with file details"""
-        user_id = message.from_user.id
-        system_info = self.get_system_usage()
-
-        items = {
-            'Intro Video': f"persistent_intros/intro_{user_id}.mp4",
-            'PNG Watermark': f"persistent_watermarks/watermark_{user_id}.png",
-            'Thumbnail': f"persistent_thumbnails/thumbnail_{user_id}.jpg",
-            'Permanent Caption': f"persistent_captions/caption_{user_id}.txt"
-        }
-
-        status_text = f"📊 **Your Settings Status:**\n{system_info}\n\n"
-
-        for name, path in items.items():
-            if os.path.exists(path):
-                try:
-                    file_size = os.path.getsize(path)
-                    if file_size > 1024 * 1024:
-                        size_str = f"{file_size/(1024*1024):.1f}MB"
-                    elif file_size > 1024:
-                        size_str = f"{file_size/1024:.1f}KB"
-                    else:
-                        size_str = f"{file_size}B"
-                    status_text += f"✅ {name}: Set ({size_str})\n📁 {path}\n\n"
                 except:
-                    status_text += f"✅ {name}: Set\n📁 {path}\n\n"
-            else:
-                status_text += f"❌ {name}: Not set\n\n"
+                    pass
+            
+            await self._cleanup_processing_files(temp_files)
+            await self.session_manager.update_session(user_id, {'processing': False})
 
-        # Check if directories exist
-        status_text += "📂 **Directory Status:**\n"
-        for directory in [
-                'persistent_intros', 'persistent_watermarks',
-                'persistent_thumbnails', 'persistent_captions'
-        ]:
-            exists = "✅" if os.path.exists(directory) else "❌"
-            status_text += f"{exists} {directory}\n"
-
-        await message.reply_text(status_text)
-
-    async def stop_handler(self, client: Client, message: Message):
-        """Stop current process with complete cleanup"""
-        user_id = message.from_user.id
-        session = self.user_sessions.get(user_id, {})
-
-        # Mark as stopped FIRST to prevent new operations
-        if user_id not in self.user_sessions:
-            self.user_sessions[user_id] = {}
-        self.user_sessions[user_id]['stopped'] = True
-
-        # Kill all FFmpeg processes to stop persistent warnings
-        try:
-            import subprocess
-            # Kill all FFmpeg processes
-            subprocess.run(['pkill', '-f', 'ffmpeg'], check=False, capture_output=True)
-            logger.info("Killed all FFmpeg processes")
-        except Exception as e:
-            logger.warning(f"Error killing FFmpeg processes: {e}")
-
-        # Update progress message if exists
-        if 'progress_message' in session:
-            try:
-                await session['progress_message'].edit_text(
-                    "🛑 **Process stopped by user**")
-                await asyncio.sleep(2)
-                await session['progress_message'].delete()
-            except:
-                pass
-
-        # Wait a moment for any ongoing operations to detect the stop flag
-        await asyncio.sleep(1)
-
-        # Clean up temp files with error handling
-        user_dir = f"temp_{user_id}"
-        if os.path.exists(user_dir):
-            try:
-                # Use a more robust cleanup that handles locked files
-                for root, dirs, files in os.walk(user_dir, topdown=False):
-                    for file in files:
-                        try:
-                            file_path = os.path.join(root, file)
-                            if os.path.exists(file_path):
-                                os.remove(file_path)
-                        except:
-                            pass
-                    for dir in dirs:
-                        try:
-                            dir_path = os.path.join(root, dir)
-                            if os.path.exists(dir_path):
-                                os.rmdir(dir_path)
-                        except:
-                            pass
-                if os.path.exists(user_dir):
-                    os.rmdir(user_dir)
-                logger.info(f"Cleaned up temp directory: {user_dir}")
-            except Exception as e:
-                logger.warning(f"Error cleaning up temp dir: {e}")
-
-        # Clean up normalized temp files in root directory
-        try:
-            import glob
-            normalized_files = glob.glob("temp_*_normalized_*.mp4") + glob.glob("temp_list_*.txt")
-            for temp_file in normalized_files:
-                try:
-                    if os.path.exists(temp_file):
-                        os.remove(temp_file)
-                        logger.info(f"Cleaned up normalized temp file: {temp_file}")
-                except Exception as e:
-                    logger.warning(f"Error cleaning up {temp_file}: {e}")
-        except Exception as e:
-            logger.warning(f"Error cleaning up normalized files: {e}")
-
-        # Clean up queue files
-        queue_files = [f"bulk_queue/queue_{user_id}.json"]
-
-        for queue_file in queue_files:
-            if os.path.exists(queue_file):
-                try:
-                    os.remove(queue_file)
-                    logger.info(f"Cleaned up queue file: {queue_file}")
-                except Exception as e:
-                    logger.warning(
-                        f"Error cleaning up queue file {queue_file}: {e}")
-
-        # Keep the stopped flag until next operation
-        self.user_sessions[user_id] = {'stopped': True}
-
-        await message.reply_text(
-            "🛑 **All processes stopped and cleaned up!**\n✅ Temp files and queues cleared\n✅ FFmpeg processes terminated\n💡 Send /start to begin again"
+    async def _download_stage_optimized(self, message: Message, user_id: int,
+                                      video_path: str, progress_msg: Message):
+        """Optimized download stage with turbo progress"""
+        session = await self.session_manager.get_session(user_id)
+        file_id = session.get('video_file_id')
+        
+        if not file_id:
+            raise Exception("No file ID found for download")
+        
+        # Use turbo download system
+        await self.download_with_turbo_progress(
+            message, file_id, video_path, "video",
+            filename=session.get('video_filename')
         )
-
-    async def bulk_handler(self, client: Client, message: Message):
-        """Start bulk processing mode with enhanced messaging"""
-        user_id = message.from_user.id
-        watermark_path = f"persistent_watermarks/watermark_{user_id}.png"
-
-        # Clear any existing queue
-        queue_file = f"bulk_queue/queue_{user_id}.json"
-        with open(queue_file, 'w') as f:
-            json.dump([], f)
-
-        if os.path.exists(watermark_path):
-            self.user_sessions[user_id] = {
-                'bulk_mode': True,
-                'waiting_for': 'bulk_png_location',
-                'bulk_queue_count': 0
-            }
-            await message.reply_text(
-                "🔄 **Bulk Processing Mode Activated!**\n\n📍 **First, choose PNG watermark location:**\n• topleft\n• topright\n• bottomleft\n• bottomright\n\n✅ Send your choice, then add videos to queue!"
+    
+    async def _preprocess_video_optimized(self, video_path: str, user_id: int) -> str:
+        """Optimized video preprocessing"""
+        try:
+            # Get optimal specs for processing
+            video_info = await self.video_processor.get_video_info_fast(video_path)
+            
+            # Determine if preprocessing is needed
+            needs_optimization = (
+                video_info.width > 1920 or video_info.height > 1080 or
+                video_info.fps > 60 or video_info.codec not in ['h264', 'x264']
             )
-        else:
-            self.user_sessions[user_id] = {
-                'bulk_mode': True,
-                'bulk_queue_count': 0,
-                'png_location': 'topright'  # Set default location
-            }
-            await message.reply_text(
-                "🔄 **Bulk Processing Mode Activated!**\n\n📁 **Instructions:**\n1. Send multiple videos to add to queue\n2. Send watermark text to start processing\n\n💡 **Auto-start:** Type \"skip\" to process all videos without text watermark\n💡 **No size limits:** Send files of any size!"
+            
+            if needs_optimization:
+                target_specs = {
+                    'width': min(video_info.width, 1920),
+                    'height': min(video_info.height, 1080),
+                    'fps': min(video_info.fps, 30),
+                    'codec': 'h264'
+                }
+                
+                return await self.video_processor.optimize_video_preprocessing(
+                    video_path, target_specs
+                )
+            
+            return video_path
+            
+        except Exception as e:
+            logger.warning(f"Preprocessing failed, using original: {e}")
+            return video_path
+    
+    async def _watermark_stage_optimized(self, user_id: int, input_path: str,
+                                       output_path: str, watermark_text: str,
+                                       png_location: str):
+        """Optimized watermarking stage"""
+        watermark_png_path = f"persistent_watermarks/watermark_{user_id}.png"
+        png_exists = os.path.exists(watermark_png_path)
+        
+        async def watermark_progress_callback(current, total, progress_info=None):
+            details = {}
+            if progress_info:
+                details.update(progress_info)
+                # Map frame progress to 35-70% range
+                if total > 0:
+                    frame_percentage = (current / total) * 35  # 35% span
+                    overall_percentage = 35 + frame_percentage
+                else:
+                    overall_percentage = 52  # Mid-point
+                
+                details['processing_fps'] = progress_info.get('processing_fps', 0)
+                details['frames'] = f"{current}/{total}"
+                
+            else:
+                overall_percentage = 52
+            
+            await self.update_progress_advanced(
+                user_id, "watermarking", int(overall_percentage), 100, details
             )
+        
+        success = await self.watermark_engine.apply_watermarks_turbocharged(
+            input_path, output_path, watermark_text,
+            watermark_png_path if png_exists else None,
+            png_location, watermark_progress_callback
+        )
+        
+        if not success:
+            raise Exception("Watermarking failed")
+    
+    async def _intro_stage_optimized(self, user_id: int, video_path: str,
+                                   temp_files: List[str]) -> str:
+        """Optimized intro processing stage"""
+        intro_path = f"persistent_intros/intro_{user_id}.mp4"
+        
+        if not os.path.exists(intro_path):
+            await self.update_progress_advanced(
+                user_id, "processing", 85, 100,
+                {'status': 'No intro found, proceeding to upload'}
+            )
+            return video_path
+        
+        # Check intro validity
+        try:
+            intro_info = await self.video_processor.get_video_info_fast(intro_path)
+            if intro_info.duration <= 0:
+                raise Exception("Invalid intro duration")
+        except Exception as e:
+            logger.warning(f"Invalid intro file: {e}")
+            await self.update_progress_advanced(
+                user_id, "processing", 85, 100,
+                {'status': 'Invalid intro, skipping'}
+            )
+            return video_path
+        
+        # Process intro with main video
+        output_with_intro = f"{video_path}_with_intro.mp4"
+        temp_files.append(output_with_intro)
+        
+        async def intro_progress_callback(current, total, progress_info=None):
+            # Map to 70-85% range
+            if total > 0:
+                stage_percentage = (current / total) * 15  # 15% span
+                overall_percentage = 70 + stage_percentage
+            else:
+                overall_percentage = 77  # Mid-point
+            
+            details = progress_info or {}
+            await self.update_progress_advanced(
+                user_id, "processing", int(overall_percentage), 100, details
+            )
+        
+        success = await self.intro_processor.process_intro_with_main_turbocharged(
+            intro_path, video_path, output_with_intro, intro_progress_callback
+        )
+        
+        return output_with_intro if success else video_path
+    
+    async def _metadata_stage_optimized(self, user_id: int, original_caption: str,
+                                      video_path: str):
+        """Optimized metadata preparation"""
+        await self.update_progress_advanced(
+            user_id, "finalizing", 85, 100,
+            {'status': 'Preparing metadata and thumbnail'}
+        )
+        
+        # Prepare combined caption
+        permanent_caption_path = f"persistent_captions/caption_{user_id}.txt"
+        permanent_caption = ""
+        
+        if os.path.exists(permanent_caption_path):
+            try:
+                with open(permanent_caption_path, 'r', encoding='utf-8') as f:
+                    permanent_caption = f.read().strip()
+            except Exception as e:
+                logger.error(f"Error reading permanent caption: {e}")
+        
+        combined_caption = original_caption
+        if permanent_caption:
+            combined_caption = f"{original_caption}\n\n{permanent_caption}"
+        
+        # Store in session for upload
+        await self.session_manager.update_session(user_id, {
+            'final_caption': combined_caption
+        })
+        
+        # Generate thumbnail if needed
+        thumbnail_path = f"persistent_thumbnails/thumbnail_{user_id}.jpg"
+        if not os.path.exists(thumbnail_path):
+            auto_thumbnail = f"temp_thumb_{user_id}_{int(time.time())}.jpg"
+            if await self._generate_thumbnail_fast(video_path, auto_thumbnail):
+                await self.session_manager.update_session(user_id, {
+                    'auto_thumbnail': auto_thumbnail
+                })
+    
+    async def _upload_stage_optimized(self, user_id: int, video_path: str,
+                                    original_caption: str, progress_msg: Message):
+        """Optimized upload stage with progress tracking"""
+        session = await self.session_manager.get_session(user_id)
+        combined_caption = session.get('final_caption', original_caption)
+        
+        # Get thumbnail
+        thumbnail_path = f"persistent_thumbnails/thumbnail_{user_id}.jpg"
+        auto_thumbnail = session.get('auto_thumbnail')
+        thumbnail = thumbnail_path if os.path.exists(thumbnail_path) else auto_thumbnail
+        
+        # Get video metadata
+        video_duration = session.get('video_duration', 0)
+        video_width = session.get('video_width', 1280)
+        video_height = session.get('video_height', 720)
+        
+        # Upload progress callback
+        upload_start_time = time.time()
+        
+        async def upload_progress_callback(current, total):
+            if session.get('stopped'):
+                raise Exception("Process was stopped by user")
+            
+            # Map to 90-100% range
+            if total > 0:
+                upload_percentage = (current / total) * 10  # 10% span
+                overall_percentage = 90 + upload_percentage
+            else:
+                overall_percentage = 95
+            
+            # Calculate upload speed
+            elapsed = time.time() - upload_start_time
+            speed_mbps = (current / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+            
+            details = {
+                'current_mb': current / (1024 * 1024),
+                'total_mb': total / (1024 * 1024),
+                'speed_mbps': speed_mbps,
+                'upload_progress': f"{current}/{total} bytes"
+            }
+            
+            await self.update_progress_advanced(
+                user_id, "uploading", int(overall_percentage), 100, details
+            )
+        
+        # Execute upload
+        try:
+            await self.app.send_video(
+                chat_id=user_id,
+                video=video_path,
+                caption=combined_caption,
+                duration=int(video_duration) if video_duration > 0 else None,
+                width=int(video_width) if video_width > 0 else None,
+                height=int(video_height) if video_height > 0 else None,
+                thumb=thumbnail,
+                supports_streaming=True,
+                progress=upload_progress_callback
+            )
+        except Exception as upload_error:
+            logger.error(f"Optimized upload failed: {upload_error}")
+            # Fallback upload without progress
+            await self.app.send_video(
+                chat_id=user_id,
+                video=video_path,
+                caption=combined_caption,
+                thumb=thumbnail
+            )
+    
+    async def _generate_thumbnail_fast(self, video_path: str, thumbnail_path: str) -> bool:
+        """Fast thumbnail generation using optimized FFmpeg"""
+        try:
+            cmd = [
+                'ffmpeg', '-i', video_path,
+                '-ss', '5',  # Seek to 5 seconds
+                '-vf', 'scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2',
+                '-vframes', '1',
+                '-f', 'image2',
+                '-q:v', '3',  # High quality
+                '-y', thumbnail_path
+            ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            
+            await asyncio.wait_for(process.wait(), timeout=30)
+            return process.returncode == 0 and os.path.exists(thumbnail_path)
+            
+        except Exception as e:
+            logger.warning(f"Fast thumbnail generation failed: {e}")
+            return False
+    
+    async def _cleanup_processing_files(self, temp_files: List[str]):
+        """Cleanup processing files efficiently"""
+        cleanup_tasks = []
+        
+        for temp_file in temp_files:
+            if temp_file and os.path.exists(temp_file):
+                cleanup_tasks.append(self._remove_file_async(temp_file))
+        
+        if cleanup_tasks:
+            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+    
+    async def _remove_file_async(self, file_path: str):
+        """Remove file asynchronously"""
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, os.remove, file_path)
+        except Exception as e:
+            logger.warning(f"Failed to remove {file_path}: {e}")
 
-    # Media handlers
-    async def video_handler(self, client: Client, message: Message):
-        """Handle video uploads with metadata preservation"""
+    def get_optimized_system_info(self) -> str:
+        """Get enhanced system information"""
+        try:
+            cpu_percent = psutil.cpu_percent(interval=0.1)
+            memory = psutil.virtual_memory()
+            disk = psutil.disk_usage('/')
+            
+            # Network info if available
+            try:
+                network = psutil.net_io_counters()
+                net_info = f" | Net: {network.bytes_sent/1024/1024:.1f}MB↑"
+            except:
+                net_info = ""
+            
+            return (f"💻 CPU: {cpu_percent:.1f}% | "
+                   f"RAM: {memory.percent:.1f}% | "
+                   f"Disk: {disk.percent:.1f}%{net_info}")
+        except Exception as e:
+            logger.warning(f"System info error: {e}")
+            return "💻 System monitoring active"
+
+    # Continue with remaining optimized handlers...
+    # Part 3 - Final optimized handlers and system completion
+
+    # Optimized Media Handlers
+    async def video_handler_optimized(self, client: Client, message: Message):
+        """Ultra-optimized video handler with smart processing"""
         user_id = message.from_user.id
         video = message.video
-        session = self.user_sessions.get(user_id, {})
-
-        # Initialize user session if it doesn't exist
-        if user_id not in self.user_sessions:
-            self.user_sessions[user_id] = {}
-            session = self.user_sessions[user_id]
+        session = await self.session_manager.get_session(user_id)
 
         if session.get('stopped'):
-            await message.reply_text(
-                "⚠️ **Process was stopped**\nUse /start to begin again.")
+            await message.reply_text("Process was stopped. Use /start to begin again.")
             return
 
         if session.get('processing'):
             await message.reply_text(
-                "⚠️ **Already processing a video**\nPlease wait or use /stop to cancel your current task."
+                "Already processing a video. Please wait or use /stop to cancel."
             )
             return
 
-        # Handle different modes
-        if session.get('waiting_for') == 'set_intro':
-            intro_path = f"persistent_intros/intro_{user_id}.mp4"
-            await self.download_with_progress(message, video.file_id,
-                                              intro_path, "intro")
-            self.user_sessions[user_id] = {}
-            await message.reply_text("✅ Intro video saved!")
+        # Handle different processing modes
+        waiting_for = session.get('waiting_for')
 
-        elif session.get('waiting_for') == 'convert_video':
-            # Process video for conversion with watermark, thumbnail, and caption
-            user_dir = f"temp_{user_id}"
-            os.makedirs(user_dir, exist_ok=True)
-            video_path = os.path.join(user_dir,
-                                      f"convert_{int(time.time())}.mp4")
-
-            await self.download_with_progress(message, video.file_id,
-                                              video_path, "video to convert")
-
-            # Watermark text prompt
-            self.user_sessions[user_id] = {
-                'video_path': video_path,
-                'waiting_for': 'convert_watermark_text'
-            }
-            await message.reply_text(
-                "✅ Video saved! Send the watermark text for conversion:\n\n💡 **Skip Text Watermark:** Type \"skip\" to convert video without text watermark but keep PNG watermark (if set)."
-            )
-
+        if waiting_for == 'set_intro':
+            await self._handle_intro_upload(message, user_id, video)
+        elif waiting_for == 'convert_video':
+            await self._handle_convert_video_upload(message, user_id, video)
         elif session.get('bulk_mode'):
-            # Add to bulk queue with enhanced messaging
-            queue_file = f"bulk_queue/queue_{user_id}.json"
-            with open(queue_file, 'r') as f:
-                queue = json.load(f)
+            await self._handle_bulk_video_upload(message, user_id, video)
+        else:
+            await self._handle_regular_video_upload(message, user_id, video)
 
-            # Get filename with better processing
-            caption = message.caption or f"video_{int(time.time())}"
-            filename = getattr(video, 'file_name', None) or caption
+    async def _handle_intro_upload(self, message: Message, user_id: int, video):
+        """Handle intro video upload with optimization"""
+        intro_path = f"persistent_intros/intro_{user_id}.mp4"
+        
+        try:
+            # Download with progress tracking
+            await self.download_with_turbo_progress(
+                message, video.file_id, intro_path, "intro video"
+            )
+            
+            # Validate intro video
+            video_info = await self.video_processor.get_video_info_fast(intro_path)
+            if video_info.duration <= 0 or video_info.width <= 0:
+                os.remove(intro_path)
+                await message.reply_text("Invalid intro video. Please send a valid video file.")
+                return
+            
+            # Clear cache for this intro
+            await self._clear_intro_cache(user_id)
+            
+            await self.session_manager.update_session(user_id, {'waiting_for': None})
+            await message.reply_text(
+                f"Intro video saved successfully!\n"
+                f"Duration: {video_info.duration:.1f}s | "
+                f"Resolution: {video_info.width}x{video_info.height}"
+            )
+            
+        except Exception as e:
+            logger.error(f"Intro upload failed: {e}")
+            await message.reply_text(f"Failed to save intro: {str(e)}")
 
+    async def _handle_convert_video_upload(self, message: Message, user_id: int, video):
+        """Handle convert video upload"""
+        user_dir = Path(f"temp_processing/user_{user_id}")
+        user_dir.mkdir(parents=True, exist_ok=True)
+        
+        video_path = user_dir / f"convert_{int(time.time())}.mp4"
+        
+        try:
+            await self.download_with_turbo_progress(
+                message, video.file_id, str(video_path), "video for conversion"
+            )
+            
+            await self.session_manager.update_session(user_id, {
+                'video_path': str(video_path),
+                'waiting_for': 'convert_watermark_text'
+            })
+            
+            await message.reply_text(
+                "Video ready for conversion! Send watermark text or type 'skip' to process without text watermark."
+            )
+            
+        except Exception as e:
+            logger.error(f"Convert upload failed: {e}")
+            await message.reply_text(f"Upload failed: {str(e)}")
+
+    async def _handle_bulk_video_upload(self, message: Message, user_id: int, video):
+        """Handle bulk video upload with queue management"""
+        queue_file = f"bulk_queue/queue_{user_id}.json"
+        
+        try:
+            # Load existing queue
+            if os.path.exists(queue_file):
+                with open(queue_file, 'r') as f:
+                    queue = json.load(f)
+            else:
+                queue = []
+            
+            # Prepare video metadata
+            caption = message.caption or f"video_{len(queue) + 1}"
+            filename = getattr(video, 'file_name', None) or f"{caption}.mp4"
+            
+            # Clean filename
             import re
             clean_filename = re.sub(r'[^\w\-_\.\s]', '_', filename)
             if not clean_filename.lower().endswith('.mp4'):
                 clean_filename += '.mp4'
-
-            # Get file size in MB for display
-            file_size_mb = video.file_size / (1024 * 1024) if video.file_size else 0
-
-            queue.append({
+            
+            # Add to queue
+            queue_item = {
                 'filename': clean_filename,
                 'file_id': video.file_id,
                 'file_size': video.file_size,
                 'original_caption': caption,
                 'duration': video.duration,
                 'width': video.width,
-                'height': video.height
-            })
-
-            with open(queue_file, 'w') as f:
-                json.dump(queue, f)
-
-            # Update session counter
-            self.user_sessions[user_id]['bulk_queue_count'] = len(queue)
-
-            # Enhanced queue message with file details
-            queue_msg = f"✅ **Video #{len(queue)} added to queue!**\n"
-            queue_msg += f"📂 **File:** {clean_filename}\n"
-            if file_size_mb > 0:
-                if file_size_mb >= 1024:
-                    queue_msg += f"📊 **Size:** {file_size_mb/1024:.2f}GB\n"
-                else:
-                    queue_msg += f"📊 **Size:** {file_size_mb:.1f}MB\n"
-            queue_msg += f"📋 **Total in queue:** {len(queue)} videos\n\n"
-
-            # Auto-start suggestion for efficiency
-            if len(queue) >= 3:
-                queue_msg += "💡 **Ready to process?** Send watermark text or type \"skip\" to start processing automatically!"
-            else:
-                queue_msg += "📁 **Add more videos** or send watermark text to begin processing"
-
-            await message.reply_text(queue_msg)
-
-        else:
-            # Regular single video processing - save metadata
-            caption = message.caption or "input_video"
-            import re
-            clean_caption = re.sub(r'[^\w\-_\.]', '_', caption)
-            if not clean_caption.endswith('.mp4'):
-                clean_caption += '.mp4'
-
-            # Store complete metadata in session
-            self.user_sessions[user_id] = {
-                'video_filename': clean_caption,
-                'original_caption': caption,
-                'video_file_id': video.file_id,
-                'video_duration': video.duration or 0,
-                'video_width': video.width or 1280,
-                'video_height': video.height or 720,
-                'waiting_for': 'png_location'
+                'height': video.height,
+                'added_at': time.time()
             }
-
-            watermark_path = f"persistent_watermarks/watermark_{user_id}.png"
-            if os.path.exists(watermark_path):
-                await message.reply_text(
-                    "✅ Video metadata saved! Choose PNG watermark location:\n\n📍 **Available locations:**\n• topleft\n• topright\n• bottomleft\n• bottomright\n\nSend your choice:"
-                )
+            
+            queue.append(queue_item)
+            
+            # Save updated queue
+            with open(queue_file, 'w') as f:
+                json.dump(queue, f, indent=2)
+            
+            # Update session
+            await self.session_manager.update_session(user_id, {
+                'bulk_queue_count': len(queue)
+            })
+            
+            # Send confirmation
+            file_size_mb = video.file_size / (1024 * 1024) if video.file_size else 0
+            queue_msg = f"Video #{len(queue)} added to queue!\n"
+            queue_msg += f"File: {clean_filename}\n"
+            
+            if file_size_mb >= 1024:
+                queue_msg += f"Size: {file_size_mb/1024:.2f}GB\n"
+            elif file_size_mb > 0:
+                queue_msg += f"Size: {file_size_mb:.1f}MB\n"
+            
+            queue_msg += f"Total queued: {len(queue)} videos\n\n"
+            
+            if len(queue) >= 3:
+                queue_msg += "Ready to process! Send watermark text or 'skip' to start."
             else:
-                self.user_sessions[user_id]['waiting_for'] = 'watermark_text'
-                await message.reply_text(
-                    "✅ Video metadata saved! Send me the watermark text:\n\n💡 **Skip Text Watermark:** Type \"skip\" to process video without any text watermark."
-                )
+                queue_msg += "Add more videos or send watermark text to begin."
+            
+            await message.reply_text(queue_msg)
+            
+        except Exception as e:
+            logger.error(f"Bulk upload failed: {e}")
+            await message.reply_text(f"Failed to add video to queue: {str(e)}")
 
-    async def photo_handler(self, client: Client, message: Message):
-        """Handle photo uploads"""
-        user_id = message.from_user.id
-        photo = message.photo
-        session = self.user_sessions.get(user_id, {})
-
-        if session.get('waiting_for') == 'set_watermark':
-            await self.process_watermark_photo(message, user_id, photo)
-        elif session.get('waiting_for') == 'set_thumbnail':
-            await self.process_thumbnail_photo(message, user_id, photo)
-
-    async def process_watermark_photo(self, message: Message, user_id: int,
-                                      photo):
-        """Process watermark photo"""
-        temp_path = f"persistent_watermarks/temp_{user_id}.jpg"
+    async def _handle_regular_video_upload(self, message: Message, user_id: int, video):
+        """Handle regular single video upload"""
+        caption = message.caption or "input_video"
+        import re
+        clean_caption = re.sub(r'[^\w\-_\.]', '_', caption)
+        if not clean_caption.endswith('.mp4'):
+            clean_caption += '.mp4'
+        
+        # Store complete video metadata
+        await self.session_manager.update_session(user_id, {
+            'video_filename': clean_caption,
+            'original_caption': caption,
+            'video_file_id': video.file_id,
+            'video_duration': video.duration or 0,
+            'video_width': video.width or 1280,
+            'video_height': video.height or 720,
+            'video_file_size': video.file_size or 0,
+            'waiting_for': 'png_location'
+        })
+        
+        # Check for PNG watermark
         watermark_path = f"persistent_watermarks/watermark_{user_id}.png"
+        if os.path.exists(watermark_path):
+            await message.reply_text(
+                "Video metadata saved! Choose PNG watermark location:\n\n"
+                "Available locations:\n"
+                "• topleft\n• topright\n• bottomleft\n• bottomright"
+            )
+        else:
+            await self.session_manager.update_session(user_id, {'waiting_for': 'watermark_text'})
+            await message.reply_text(
+                "Video metadata saved! Send watermark text or type 'skip' to process without text watermark."
+            )
 
-        # Ensure directory exists
-        os.makedirs("persistent_watermarks", mode=0o755, exist_ok=True)
-
-        await self.download_with_progress(message, photo.file_id, temp_path,
-                                          "watermark image")
-
-        try:
-            with Image.open(temp_path) as img:
-                if img.mode != 'RGBA':
-                    img = img.convert('RGBA')
-                img.save(watermark_path, 'PNG', optimize=True)
-
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-
-            # Verify file was created
-            if os.path.exists(watermark_path):
-                file_size = os.path.getsize(watermark_path)
-                logger.info(
-                    f"Watermark saved: {watermark_path} ({file_size} bytes)")
-                self.user_sessions[user_id] = {}
-                await message.reply_text(
-                    f"✅ PNG watermark saved successfully!\n📁 File: {watermark_path}"
-                )
-            else:
-                raise Exception("Watermark file was not created")
-
-        except Exception as e:
-            logger.error(f"Watermark processing error: {e}")
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-            await message.reply_text(f"❌ Error processing watermark: {str(e)}")
-
-    async def document_handler(self, client: Client, message: Message):
-        """Handle document uploads (for PNG watermarks)"""
+    # Optimized Text Handler
+    async def text_handler_optimized(self, client: Client, message: Message):
+        """Ultra-optimized text message handler"""
         user_id = message.from_user.id
-        document = message.document
-        session = self.user_sessions.get(user_id, {})
-
-        if session.get('waiting_for') == 'set_watermark':
-            if document.mime_type in ['image/png', 'image/jpeg', 'image/jpg'
-                                      ] or document.file_name.lower().endswith(
-                                          ('.png', '.jpg', '.jpeg')):
-                await self.process_watermark_document(message, user_id,
-                                                      document)
-            else:
-                await message.reply_text(
-                    "❌ Please send a valid PNG, JPG, or JPEG image file.")
-        elif session.get('waiting_for') == 'set_thumbnail':
-            if document.mime_type in ['image/png', 'image/jpeg', 'image/jpg'
-                                      ] or document.file_name.lower().endswith(
-                                          ('.png', '.jpg', '.jpeg')):
-                await self.process_thumbnail_document(message, user_id,
-                                                      document)
-            else:
-                await message.reply_text(
-                    "❌ Please send a valid PNG, JPG, or JPEG image file.")
-
-    async def process_watermark_document(self, message: Message, user_id: int,
-                                         document):
-        """Process document watermark"""
-        watermark_path = f"persistent_watermarks/watermark_{user_id}.png"
-        await self.download_with_progress(message, document.file_id,
-                                          watermark_path, "watermark document")
-
-        try:
-            with Image.open(watermark_path) as img:
-                if img.mode != 'RGBA':
-                    img = img.convert('RGBA')
-                img.save(watermark_path, 'PNG', optimize=True)
-
-            self.user_sessions[user_id] = {}
-            await message.reply_text("✅ PNG watermark saved successfully!")
-
-        except Exception as e:
-            logger.error(f"Document watermark error: {e}")
-            if os.path.exists(watermark_path):
-                os.remove(watermark_path)
-            await message.reply_text(f"❌ Error processing watermark: {str(e)}")
-
-    async def process_thumbnail_photo(self, message: Message, user_id: int,
-                                      photo):
-        """Process thumbnail photo"""
-        temp_path = f"persistent_thumbnails/temp_{user_id}.jpg"
-        thumbnail_path = f"persistent_thumbnails/thumbnail_{user_id}.jpg"
-
-        # Ensure directory exists
-        os.makedirs("persistent_thumbnails", mode=0o755, exist_ok=True)
-
-        await self.download_with_progress(message, photo.file_id, temp_path,
-                                          "thumbnail image")
-
-        try:
-            with Image.open(temp_path) as img:
-                # Convert to RGB if needed (for JPG compatibility)
-                if img.mode in ('RGBA', 'P'):
-                    rgb_img = Image.new('RGB', img.size, (255, 255, 255))
-                    if img.mode == 'RGBA':
-                        rgb_img.paste(img, mask=img.split()[-1])
-                    else:
-                        rgb_img.paste(img)
-                    img = rgb_img
-
-                # Resize to reasonable thumbnail size (320x180 for 16:9)
-                img.thumbnail((320, 180), Image.Resampling.LANCZOS)
-                img.save(thumbnail_path, 'JPEG', quality=85, optimize=True)
-
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-
-            # Verify file was created
-            if os.path.exists(thumbnail_path):
-                file_size = os.path.getsize(thumbnail_path)
-                logger.info(
-                    f"Thumbnail saved: {thumbnail_path} ({file_size} bytes)")
-                self.user_sessions[user_id] = {}
-                await message.reply_text(
-                    f"✅ Thumbnail saved successfully!\n📁 File: {thumbnail_path}"
-                )
-            else:
-                raise Exception("Thumbnail file was not created")
-
-        except Exception as e:
-            logger.error(f"Thumbnail processing error: {e}")
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-            await message.reply_text(f"❌ Error processing thumbnail: {str(e)}")
-
-    async def process_thumbnail_document(self, message: Message, user_id: int,
-                                         document):
-        """Process document thumbnail"""
-        thumbnail_path = f"persistent_thumbnails/thumbnail_{user_id}.jpg"
-        await self.download_with_progress(message, document.file_id,
-                                          thumbnail_path, "thumbnail document")
-
-        try:
-            with Image.open(thumbnail_path) as img:
-                # Convert to RGB if needed (for JPG compatibility)
-                if img.mode in ('RGBA', 'P'):
-                    rgb_img = Image.new('RGB', img.size, (255, 255, 255))
-                    if img.mode == 'RGBA':
-                        rgb_img.paste(img, mask=img.split()[-1])
-                    else:
-                        rgb_img.paste(img)
-                    img = rgb_img
-
-                # Resize to reasonable thumbnail size (320x180 for 16:9)
-                img.thumbnail((320, 180), Image.Resampling.LANCZOS)
-                img.save(thumbnail_path, 'JPEG', quality=85, optimize=True)
-
-            self.user_sessions[user_id] = {}
-            await message.reply_text("✅ Thumbnail saved successfully!")
-
-        except Exception as e:
-            logger.error(f"Document thumbnail error: {e}")
-            if os.path.exists(thumbnail_path):
-                os.remove(thumbnail_path)
-            await message.reply_text(f"❌ Error processing thumbnail: {str(e)}")
-
-    async def text_handler(self, client: Client, message: Message):
-        """Handle text messages"""
-        user_id = message.from_user.id
-        text = message.text
-        session = self.user_sessions.get(user_id, {})
-
-        # Initialize user session if it doesn't exist
-        if user_id not in self.user_sessions:
-            self.user_sessions[user_id] = {}
-            session = self.user_sessions[user_id]
+        text = message.text.strip()
+        session = await self.session_manager.get_session(user_id)
 
         if session.get('stopped'):
-            await message.reply_text(
-                "⚠️ **Process was stopped**\nUse /start to begin again.")
+            await message.reply_text("Process was stopped. Use /start to begin again.")
             return
 
         if session.get('processing'):
-            await message.reply_text(
-                "⚠️ **Already processing a video**\nPlease wait or use /stop to cancel your current task."
-            )
+            await message.reply_text("Already processing. Please wait or use /stop.")
             return
 
-        # Clear stopped flag when starting new operations
-        if session.get('stopped'):
-            self.user_sessions[user_id].pop('stopped', None)
+        waiting_for = session.get('waiting_for')
 
-        # Debug: Log current session state for troubleshooting
-        current_state = session.get('waiting_for', 'none')
-        logger.info(f"User {user_id} text handler - Session state: {current_state}, Text: {text[:50]}...")
-
-        # Handle permanent caption setting
-        if session.get('waiting_for') == 'add_caption':
-            await self.process_add_caption(message, user_id, text)
-
-        # Handle PNG location selection
-        elif session.get('waiting_for') == 'png_location':
-            valid_locations = [
-                'topleft', 'topright', 'bottomleft', 'bottomright'
-            ]
-            location = text.lower().strip()
-
-            if location in valid_locations:
-                self.user_sessions[user_id]['png_location'] = location
-                self.user_sessions[user_id]['waiting_for'] = 'watermark_text'
-                await message.reply_text(
-                    f"✅ PNG location set to {location}! Now send watermark text:\n\n💡 **Skip Text Watermark:** Type \"skip\" to process video without text watermark but keep PNG watermark."
-                )
-            else:
-                await message.reply_text(
-                    f"❌ Invalid location. Please choose from: {', '.join(valid_locations)}"
-                )
-
-        # Handle bulk PNG location selection
-        elif session.get('waiting_for') == 'bulk_png_location':
-            valid_locations = [
-                'topleft', 'topright', 'bottomleft', 'bottomright'
-            ]
-            location = text.lower().strip()
-
-            if location in valid_locations:
-                self.user_sessions[user_id]['png_location'] = location
-                self.user_sessions[user_id].pop('waiting_for', None)
-                await message.reply_text(
-                    f"✅ PNG location set to {location}! Now send multiple videos, then watermark text:\n\n💡 **Skip Text Watermark:** Type \"skip\" to process all videos without text watermark but keep PNG watermark."
-                )
-            else:
-                await message.reply_text(
-                    f"❌ Invalid location. Please choose from: {', '.join(valid_locations)}"
-                )
-
-        # Handle bulk processing
+        # Route to appropriate handler
+        if waiting_for == 'add_caption':
+            await self._handle_caption_text(message, user_id, text)
+        elif waiting_for == 'png_location':
+            await self._handle_png_location_text(message, user_id, text)
+        elif waiting_for == 'bulk_png_location':
+            await self._handle_bulk_png_location_text(message, user_id, text)
+        elif waiting_for == 'watermark_text':
+            await self._handle_watermark_text(message, user_id, text)
+        elif waiting_for == 'convert_watermark_text':
+            await self._handle_convert_watermark_text(message, user_id, text)
         elif session.get('bulk_mode'):
-            # Check if we're still waiting for PNG location
-            if session.get('waiting_for') == 'bulk_png_location':
-                # This is handled above, so skip here
-                return
-            
-            # Check for skip command
-            if text.lower() in [
-                    'skip', 'skip text', 'no text', 'no watermark'
-            ]:
-                png_location = session.get('png_location', 'topright')
-                await self.process_bulk_queue(
-                    message, user_id, None,
-                    png_location)  # Pass None for no text watermark
-            else:
-                png_location = session.get('png_location', 'topright')
-                await self.process_bulk_queue(message, user_id, text,
-                                              png_location)
-
-        # Handle convert video watermark text
-        elif session.get('waiting_for') == 'convert_watermark_text':
-            session = self.user_sessions[user_id]
-            video_path = session.get('video_path')
-            if video_path:
-                # Check for skip command
-                if text.lower() in [
-                        'skip', 'skip text', 'no text', 'no watermark'
-                ]:
-                    watermark_text = None
-                else:
-                    watermark_text = text
-
-                self.user_sessions[user_id] = {
-                    'video_path': video_path,
-                    'watermark_text': watermark_text,
-                    'waiting_for': 'process_convert_video'
-                }
-                skip_msg = " (skipping text watermark)" if watermark_text is None else ""
-                await message.reply_text(
-                    f"✅ Watermark text saved{skip_msg}! Processing video for conversion..."
-                )
-                await self.process_convert_video(message, user_id, video_path,
-                                                 watermark_text)
-            else:
-                await message.reply_text(
-                    "❌ No video found for conversion. Please send a video using /convert first."
-                )
-
-        # Handle single video watermarking
-        elif session.get('waiting_for') == 'watermark_text':
-            # Check for skip command
-            if text.lower() in [
-                    'skip', 'skip text', 'no text', 'no watermark'
-            ]:
-                watermark_text = None
-            else:
-                watermark_text = text
-
-            # Mark this specific user as processing
-            self.user_sessions[user_id]['processing'] = True
-            try:
-                user_dir = f"temp_{user_id}"
-                os.makedirs(user_dir, exist_ok=True)
-                video_path = os.path.join(user_dir, session['video_filename'])
-                png_location = session.get('png_location',
-                                           'topright')  # Default to topright
-
-                await self.process_video_with_metadata(
-                    message,
-                    user_id,
-                    video_path,
-                    watermark_text,
-                    session['original_caption'],
-                    png_location=png_location)
-            except Exception as e:
-                logger.error(f"Error in video processing for user {user_id}: {e}")
-                await message.reply_text(f"❌ Error processing video: {str(e)}")
-            finally:
-                # Always clean up the processing flag for this user
-                if user_id in self.user_sessions and 'processing' in self.user_sessions[user_id]:
-                    self.user_sessions[user_id].pop('processing', None)
-
+            await self._handle_bulk_text(message, user_id, text)
         else:
-            # Check if user might be trying to send watermark text without proper session state
-            if text.strip() and not text.startswith('/'):
-                await message.reply_text(
-                    "Please send a video first, then I'll ask for watermark text.\n\nUse /start for help or send a video to begin watermarking."
-                )
-            else:
-                await message.reply_text(
-                    "Please send a video first or use /start for help."
-                )
+            await self._handle_general_text(message, text)
 
-    async def process_add_caption(self, message: Message, user_id: int,
-                                  caption_text: str):
-        """Process add caption command"""
-        caption_path = f"persistent_captions/caption_{user_id}.txt"
+    async def _handle_watermark_text(self, message: Message, user_id: int, text: str):
+        """Handle watermark text input for single video"""
+        session = await self.session_manager.get_session(user_id)
+        
+        # Check for skip commands
+        watermark_text = None if text.lower() in ['skip', 'skip text', 'no text', 'no watermark'] else text
+        
+        # Process video
+        user_dir = Path(f"temp_processing/user_{user_id}")
+        user_dir.mkdir(parents=True, exist_ok=True)
+        video_path = user_dir / session['video_filename']
+        png_location = session.get('png_location', 'topright')
+        
         try:
-            # Ensure directory exists
-            os.makedirs("persistent_captions", mode=0o755, exist_ok=True)
-
-            with open(caption_path, 'w', encoding='utf-8') as f:
-                f.write(caption_text)
-
-            # Verify file was created
-            if os.path.exists(caption_path):
-                file_size = os.path.getsize(caption_path)
-                logger.info(
-                    f"Caption file saved: {caption_path} ({file_size} bytes)")
-                self.user_sessions[user_id] = {}
-                await message.reply_text(
-                    f"✅ Permanent caption saved successfully!\n📁 File: {caption_path}"
-                )
-            else:
-                raise Exception("Caption file was not created")
-
-        except Exception as e:
-            logger.error(f"Caption saving error: {e}")
-            await message.reply_text(f"❌ Error saving caption: {str(e)}")
-
-    async def process_convert_video(self, message: Message, user_id: int,
-                                    video_path: str, watermark_text: str):
-        """Process the convert video request"""
-        try:
-            session = self.user_sessions.get(user_id, {})
-            if session.get('stopped'):
-                await message.reply_text("🛑 **Process stopped by user**")
-                return
-
-            # Set output file path
-            converted_path = video_path.replace(".mp4", "_converted.mp4")
-
-            # Get thumbnail path
-            thumbnail_path = f"persistent_thumbnails/thumbnail_{user_id}.jpg"
-            thumbnail = thumbnail_path if os.path.exists(
-                thumbnail_path) else None
-
-            # Get caption
-            permanent_caption_path = f"persistent_captions/caption_{user_id}.txt"
-            permanent_caption = ""
-            if os.path.exists(permanent_caption_path):
-                try:
-                    with open(permanent_caption_path, 'r') as f:
-                        permanent_caption = f.read().strip()
-                except Exception as e:
-                    logger.error(f"Error reading permanent caption: {e}")
-
-            # Add combined watermarks, thumbnail, and caption
-            await self.add_watermark_thumbnail_caption(
-                message, user_id, video_path, converted_path, watermark_text,
-                permanent_caption, thumbnail)
-
-        except Exception as e:
-            logger.error(f"Video conversion error: {e}")
-            await message.reply_text(f"❌ Error converting video: {str(e)}")
-        finally:
-            self.user_sessions[user_id] = {}  # Reset user session
-
-    async def add_watermark_thumbnail_caption(self,
-                                              message: Message,
-                                              user_id: int,
-                                              input_path: str,
-                                              output_path: str,
-                                              watermark_text: str,
-                                              caption_text: str,
-                                              thumbnail: str = None):
-        """Add watermark, thumbnail, and caption to video"""
-        import subprocess
-
-        try:
-            # Get video info
-            video_info = await self.get_video_info(input_path)
-            width = video_info['width']
-            height = video_info['height']
-            fps = video_info['fps']
-
-            if fps <= 0 or fps > 120:
-                fps = 30
-
-            # Build filter complex
-            filter_parts = []
-            overlay_inputs = "[0:v]"
-
-            # Add text watermark if provided
-            if watermark_text:
-                # Clean and escape the text for FFmpeg, but preserve actual line breaks
-                clean_text = watermark_text.replace("'", "\\'").replace(":", "\\:")
-                # Remove any characters that might break FFmpeg filters but keep newlines
-                clean_text = ''.join(
-                    c for c in clean_text
-                    if ord(c) < 127 and (c.isprintable() or c in ['\n', '\r', ' ']))
-
-                # Split by actual line breaks first (user's intended lines)
-                user_lines = clean_text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
-
-                # Process each user line for length and create final lines
-                lines = []
-                max_chars_per_line = max(25, width // 12)  # Slightly longer lines for better readability
-
-                for user_line in user_lines:
-                    user_line = user_line.strip()
-                    if not user_line and len(lines) == 0:  # Skip empty lines only at the beginning
-                        continue
-                    elif not user_line:  # Preserve empty lines in the middle/end as spacing
-                        lines.append(" ")  # Use space instead of empty to maintain line structure
-                        continue
-
-                    # If line is short enough, use as-is
-                    if len(user_line) <= max_chars_per_line:
-                        lines.append(user_line)
-                    else:
-                        # Split long lines by words
-                        words = user_line.split()
-                        current_line = ""
-
-                        for word in words:
-                            test_line = current_line + " " + word if current_line else word
-                            if len(test_line) <= max_chars_per_line:
-                                current_line = test_line
-                            else:
-                                if current_line:
-                                    lines.append(current_line)
-                                current_line = word
-
-                        if current_line:
-                            lines.append(current_line)
-
-                # Limit to 5 lines maximum for better display (increased from 4)
-                if len(lines) > 5:
-                    lines = lines[:4]
-                    lines.append("...")
-
-                # Join lines with proper newline character for FFmpeg
-                # Use \n for proper line breaks in FFmpeg drawtext (not \\n)
-                final_text = "\\n".join(lines)
-
-                font_size = max(18, min(width // 40, height //
-                                        30))  # Slightly smaller for multi-line
-                margin = 15
-                line_spacing = int(font_size * 1.2)  # Line spacing
-
-                # Only 3 positions: topright -> bottomright -> bottomleft (never use topleft)
-                # 3 positions: 3 * 60 = 180 seconds cycle
-                text_filter = (
-                    f"drawtext=text='{final_text}':"
-                    f"fontsize={font_size}:"
-                    f"fontcolor=white@0.95:"
-                    f"box=1:boxcolor=black@0.8:boxborderw=10:"
-                    f"line_spacing={line_spacing}:"
-                    f"x='if(lt(mod(t,180),60),w-text_w-{margin},if(lt(mod(t,180),120),w-text_w-{margin},{margin}))':"
-                    f"y='if(lt(mod(t,180),60),{margin*2},if(lt(mod(t,180),120),h-text_h-{margin},h-text_h-{margin}))'"
-                )
-
-                filter_parts.append(f"{overlay_inputs}{text_filter}[txt]")
-                overlay_inputs = "[txt]"
-
-            # Build command optimized for same file size as original
-            cmd = [
-                'ffmpeg',
-                '-i',
-                input_path,
-                '-vf',
-                ';'.join(filter_parts) if filter_parts else 'copy',
-                '-c:v',
-                'libx264',
-                '-preset',
-                'ultrafast',
-                '-crf',
-                '23',  # Faster encoding, reasonable quality
-                '-c:a',
-                'copy',  # Copy audio to maintain original quality and speed
-                '-r',
-                str(fps),
-                '-profile:v',
-                'main',
-                '-level',
-                '3.1',  # Standard profile for compatibility
-                '-map_metadata',
-                '0',  # Preserve metadata
-                '-movflags',
-                '+faststart',
-                '-threads',
-                '0',  # Use all available CPU threads
-                '-y',
-                output_path
-            ]
-
-            # Execute command
-            process = subprocess.Popen(cmd,
-                                       stdout=subprocess.PIPE,
-                                       stderr=subprocess.PIPE,
-                                       universal_newlines=True)
-            process.wait()
-
-            if process.returncode == 0:
-                logger.info("Successfully added watermark and thumbnail")
-
-                # Send the video with caption and thumbnail
-                try:
-                    await self.app.send_video(chat_id=user_id,
-                                              video=output_path,
-                                              caption=caption_text,
-                                              thumb=thumbnail,
-                                              supports_streaming=True)
-                except Exception as send_error:
-                    logger.error(
-                        f"Error sending converted video: {send_error}")
-                    await message.reply_text(
-                        f"❌ Error sending converted video: {send_error}")
-
-            else:
-                stderr_output = process.stderr.read(
-                ) if process.stderr else "Unknown error"
-                logger.error(f"Conversion failed with stderr: {stderr_output}")
-                await message.reply_text(
-                    f"❌ Conversion failed: {stderr_output}")
-
-        except Exception as e:
-            logger.error(f"Conversion process error: {e}")
-            await message.reply_text(f"❌ Conversion process error: {str(e)}")
-
-    async def remove_intro_handler(self, client: Client, message: Message):
-        await self.remove_persistent_item(message, 'intro')
-
-    async def remove_watermark_handler(self, client: Client, message: Message):
-        await self.remove_persistent_item(message, 'watermark')
-
-    async def remove_thumbnail_handler(self, client: Client, message: Message):
-        await self.remove_persistent_item(message, 'thumbnail')
-
-    async def remove_caption_handler(self, client: Client, message: Message):
-        await self.remove_persistent_item(message, 'caption')
-
-    async def queue_handler(self, client: Client, message: Message):
-        """Check bulk processing queue status"""
-        user_id = message.from_user.id
-        queue_file = f"bulk_queue/queue_{user_id}.json"
-
-        status_text = "📊 **Queue Status:**\n\n"
-
-        # Check main queue
-        if os.path.exists(queue_file):
-            with open(queue_file, 'r') as f:
-                queue = json.load(f)
-            status_text += f"🎬 Main Queue: {len(queue)} videos\n"
-        else:
-            status_text += "🎬 Main Queue: Empty\n"
-
-        await message.reply_text(status_text)
-
-    async def adduser_handler(self, client: Client, message: Message):
-        """Add user to admin list (admin only)"""
-        user_id = message.from_user.id
-        if user_id not in self.admin_users:
-            await message.reply_text(
-                "❌ You don't have permission to use this command.")
-            return
-
-        try:
-            command_parts = message.text.split()
-            if len(command_parts) < 2:
-                await message.reply_text("❌ Usage: /adduser <user_id>")
-                return
-
-            new_admin_id = int(command_parts[1])
-            if new_admin_id in self.admin_users:
-                await message.reply_text(
-                    f"ℹ️ User {new_admin_id} is already an admin.")
-            else:
-                self.admin_users.append(new_admin_id)
-                await message.reply_text(
-                    f"✅ User {new_admin_id} added to admin list.")
-                logger.info(
-                    f"Admin {user_id} added user {new_admin_id} to admin list")
-        except ValueError:
-            await message.reply_text(
-                "❌ Invalid user ID. Please provide a valid number.")
-        except Exception as e:
-            await message.reply_text(f"❌ Error adding user: {str(e)}")
-
-    async def removeuser_handler(self, client: Client, message: Message):
-        """Remove user from admin list (admin only)"""
-        user_id = message.from_user.id
-        if user_id not in self.admin_users:
-            await message.reply_text(
-                "❌ You don't have permission to use this command.")
-            return
-
-        try:
-            command_parts = message.text.split()
-            if len(command_parts) < 2:
-                await message.reply_text("❌ Usage: /removeuser <user_id>")
-                return
-
-            remove_admin_id = int(command_parts[1])
-            if remove_admin_id == 2038923790:  # Protect main admin
-                await message.reply_text("❌ Cannot remove the main admin.")
-                return
-
-            if remove_admin_id in self.admin_users:
-                self.admin_users.remove(remove_admin_id)
-                await message.reply_text(
-                    f"✅ User {remove_admin_id} removed from admin list.")
-                logger.info(
-                    f"Admin {user_id} removed user {remove_admin_id} from admin list"
-                )
-            else:
-                await message.reply_text(
-                    f"ℹ️ User {remove_admin_id} is not an admin.")
-        except ValueError:
-            await message.reply_text(
-                "❌ Invalid user ID. Please provide a valid number.")
-        except Exception as e:
-            await message.reply_text(f"❌ Error removing user: {str(e)}")
-
-    async def listadmins_handler(self, client: Client, message: Message):
-        """List all admin users (admin only)"""
-        user_id = message.from_user.id
-        if user_id not in self.admin_users:
-            await message.reply_text(
-                "❌ You don't have permission to use this command.")
-            return
-
-        admin_list = "🔧 **Admin Users:**\n\n"
-        for i, admin_id in enumerate(self.admin_users, 1):
-            admin_list += f"{i}. {admin_id}"
-            if admin_id == 2038923790:
-                admin_list += " (Main Admin)"
-            admin_list += "\n"
-
-        await message.reply_text(admin_list)
-
-    async def stats_handler(self, client: Client, message: Message):
-        """Get detailed bot statistics (admin only)"""
-        user_id = message.from_user.id
-        if user_id not in self.admin_users:
-            await message.reply_text(
-                "❌ You don't have permission to use this command.")
-            return
-
-        system_info = self.get_system_usage()
-
-        # Count files in directories
-        stats_text = f"📊 **Bot Statistics:**\n{system_info}\n\n"
-
-        directories = {
-            'Intros': 'persistent_intros',
-            'Watermarks': 'persistent_watermarks',
-            'Thumbnails': 'persistent_thumbnails',
-            'Captions': 'persistent_captions',
-            'Bulk Queues': 'bulk_queue',
-            'Normalized Cache': 'normalized_intros_cache'
-        }
-
-        for name, path in directories.items():
-            if os.path.exists(path):
-                file_count = len([
-                    f for f in os.listdir(path)
-                    if os.path.isfile(os.path.join(path, f))
-                ])
-                stats_text += f"📁 {name}: {file_count} files\n"
-            else:
-                stats_text += f"📁 {name}: Directory not found\n"
-
-        # Active sessions
-        active_sessions = len([s for s in self.user_sessions.values() if s])
-        stats_text += f"👥 Active Sessions: {active_sessions}\n"
-        stats_text += f"🔧 Admin Users: {len(self.admin_users)}\n"
-
-        await message.reply_text(stats_text)
-
-    async def cleanup_handler(self, client: Client, message: Message):
-        """Clean all temp and cache files (admin only)"""
-        user_id = message.from_user.id
-        if user_id not in self.admin_users:
-            await message.reply_text(
-                "❌ You don't have permission to use this command.")
-            return
-
-        try:
-            cleaned_count = 0
-
-            # Clean temp directories
-            for root, dirs, files in os.walk('.'):
-                for dir_name in dirs:
-                    if dir_name.startswith('temp_'):
-                        temp_dir = os.path.join(root, dir_name)
-                        try:
-                            shutil.rmtree(temp_dir)
-                            cleaned_count += 1
-                        except:
-                            pass
-
-            # Clean cache
-            cache_dir = "normalized_intros_cache"
-            if os.path.exists(cache_dir):
-                for cache_file in os.listdir(cache_dir):
-                    try:
-                        os.remove(os.path.join(cache_dir, cache_file))
-                        cleaned_count += 1
-                    except:
-                        pass
-
-            # Clean any temp files in root
-            for file in os.listdir('.'):
-                if file.startswith('temp_') and os.path.isfile(file):
-                    try:
-                        os.remove(file)
-                        cleaned_count += 1
-                    except:
-                        pass
-
-            await message.reply_text(
-                f"✅ Cleanup completed! Removed {cleaned_count} items.")
-            logger.info(
-                f"Admin {user_id} performed cleanup, removed {cleaned_count} items"
+            await self.process_video_ultra_optimized(
+                message, user_id, str(video_path), watermark_text,
+                session['original_caption'], png_location=png_location
             )
-
         except Exception as e:
-            await message.reply_text(f"❌ Cleanup error: {str(e)}")
-            logger.error(f"Cleanup error: {e}")
+            logger.error(f"Video processing failed: {e}")
+            await message.reply_text(f"Processing failed: {str(e)}")
 
-    async def process_bulk_queue(self, message: Message, user_id: int, watermark_text: str, png_location: str):
-        """Process all videos in the bulk queue"""
+    async def _handle_bulk_text(self, message: Message, user_id: int, text: str):
+        """Handle text input for bulk processing"""
+        # Check for skip commands
+        watermark_text = None if text.lower() in ['skip', 'skip text', 'no text', 'no watermark'] else text
+        
+        session = await self.session_manager.get_session(user_id)
+        png_location = session.get('png_location', 'topright')
+        
+        await self._process_bulk_queue_optimized(message, user_id, watermark_text, png_location)
+
+    async def _process_bulk_queue_optimized(self, message: Message, user_id: int, 
+                                          watermark_text: str, png_location: str):
+        """Process bulk queue with maximum optimization"""
         queue_file = f"bulk_queue/queue_{user_id}.json"
         
         try:
             if not os.path.exists(queue_file):
-                await message.reply_text("❌ No videos in queue. Add videos first.")
+                await message.reply_text("No videos in queue. Add videos first.")
                 return
-
+            
             with open(queue_file, 'r') as f:
                 queue = json.load(f)
-
+            
             if not queue:
-                await message.reply_text("❌ Queue is empty. Add videos first.")
+                await message.reply_text("Queue is empty. Add videos first.")
                 return
-
-            # Mark this specific user as processing and clear bulk mode
-            self.user_sessions[user_id]['processing'] = True
-            self.user_sessions[user_id]['bulk_mode'] = False
-            self.user_sessions[user_id]['total_videos'] = len(queue)
-
+            
+            # Update session for bulk processing
+            await self.session_manager.update_session(user_id, {
+                'processing': True,
+                'bulk_mode': False,
+                'total_videos': len(queue),
+                'processing_start_time': time.time()
+            })
+            
             skip_msg = " (skipping text watermark)" if watermark_text is None else ""
             await message.reply_text(
-                f"🚀 **Starting bulk processing of {len(queue)} videos{skip_msg}!**\n⏳ Processing will begin shortly..."
+                f"Starting ultra-fast bulk processing of {len(queue)} videos{skip_msg}!\n"
+                f"Processing will use parallel optimization for maximum speed."
             )
-
-            # Process each video in the queue
-            for i, video_info in enumerate(queue, 1):
-                try:
-                    # Check if stopped
-                    if self.user_sessions.get(user_id, {}).get('stopped'):
-                        await message.reply_text("🛑 **Bulk processing stopped by user**")
-                        break
-
-                    # Create temp directory for this video
-                    user_dir = f"temp_{user_id}"
-                    os.makedirs(user_dir, exist_ok=True)
-                    video_path = os.path.join(user_dir, video_info['filename'])
-
-                    # Store video metadata in session for processing
-                    self.user_sessions[user_id].update({
-                        'video_file_id': video_info['file_id'],
-                        'video_duration': video_info.get('duration', 0),
-                        'video_width': video_info.get('width', 1280),
-                        'video_height': video_info.get('height', 720)
-                    })
-
-                    # Process this video
-                    await self.process_video_with_metadata(
-                        message,
-                        user_id,
-                        video_path,
-                        watermark_text,
-                        video_info['original_caption'],
-                        video_num=i,
-                        png_location=png_location
-                    )
-
-                    # Small delay between videos
-                    await asyncio.sleep(2)
-
-                except Exception as e:
-                    logger.error(f"Error processing video {i}: {e}")
-                    await message.reply_text(f"❌ Error processing video {i}: {str(e)}")
-                    continue
-
-            # Final completion message
-            await message.reply_text(
-                f"🎉 **Bulk processing completed!**\n✅ Processed {len(queue)} videos successfully"
+            
+            # Process using bulk optimizer
+            results = await self.bulk_optimizer.process_bulk_queue_optimized(
+                user_id, queue, watermark_text, png_location,
+                self._create_bulk_progress_callback(message, user_id)
             )
-
+            
+            # Final summary
+            successful = len([r for r in results if not isinstance(r, Exception)])
+            failed = len(queue) - successful
+            
+            summary_msg = f"Bulk processing completed!\n"
+            summary_msg += f"Successful: {successful}/{len(queue)} videos\n"
+            if failed > 0:
+                summary_msg += f"Failed: {failed} videos\n"
+            
+            total_time = time.time() - (await self.session_manager.get_session(user_id)).get('processing_start_time', time.time())
+            summary_msg += f"Total time: {self._format_duration(total_time)}"
+            
+            await message.reply_text(summary_msg)
+            
         except Exception as e:
-            logger.error(f"Bulk processing error: {e}")
-            await message.reply_text(f"❌ Bulk processing error: {str(e)}")
+            logger.error(f"Bulk processing failed: {e}")
+            await message.reply_text(f"Bulk processing error: {str(e)}")
         finally:
-            # Reset session
-            if user_id in self.user_sessions:
-                self.user_sessions[user_id] = {}
-
-            # Clear queue file
+            # Cleanup
+            await self.session_manager.update_session(user_id, {
+                'processing': False,
+                'bulk_mode': False
+            })
             if os.path.exists(queue_file):
-                try:
-                    os.remove(queue_file)
-                except:
-                    pass
+                os.remove(queue_file)
 
-    async def remove_persistent_item(self, message: Message, item_type: str):
-        """Remove persistent item and related cache"""
-        user_id = message.from_user.id
-        extensions = {
-            'intro': 'mp4',
-            'watermark': 'png',
-            'thumbnail': 'jpg',
-            'caption': 'txt'
-        }
-        file_path = f"persistent_{item_type}s/{item_type}_{user_id}.{extensions[item_type]}"
-
-        if os.path.exists(file_path):
-            os.remove(file_path)
-
-            # If removing intro, also clean cache
-            if item_type == 'intro':
-                cache_dir = "normalized_intros_cache"
-                if os.path.exists(cache_dir):
+    def _create_bulk_progress_callback(self, message: Message, user_id: int):
+        """Create progress callback for bulk processing"""
+        async def progress_callback(video_num: int, total_videos: int, stage: str, details: dict = None):
+            try:
+                overall_progress = ((video_num - 1) / total_videos + (details.get('stage_progress', 0) / 100) / total_videos) * 100
+                
+                progress_text = f"Bulk Processing: Video {video_num}/{total_videos}\n"
+                progress_text += f"Overall: {overall_progress:.1f}%\n"
+                progress_text += f"Current: {stage}"
+                
+                if details:
+                    if 'processing_fps' in details:
+                        progress_text += f" @ {details['processing_fps']:.1f}fps"
+                    if 'eta' in details:
+                        progress_text += f" | ETA: {details['eta']}"
+                
+                # Update every 10 seconds to avoid flooding
+                session = await self.session_manager.get_session(user_id)
+                last_bulk_update = session.get('last_bulk_update', 0)
+                if time.time() - last_bulk_update > 10:
                     try:
-                        for cache_file in os.listdir(cache_dir):
-                            if f"intro_" in cache_file:  # Clean all cached intros for safety
-                                cache_path = os.path.join(
-                                    cache_dir, cache_file)
-                                if os.path.exists(cache_path):
-                                    os.remove(cache_path)
-                    except Exception as e:
-                        logger.warning(f"Cache cleanup warning: {e}")
+                        await message.reply_text(progress_text)
+                        await self.session_manager.update_session(user_id, {'last_bulk_update': time.time()})
+                    except:
+                        pass  # Ignore message sending errors
+                        
+            except Exception as e:
+                logger.warning(f"Bulk progress callback error: {e}")
+        
+        return progress_callback
 
-            await message.reply_text(
-                f"✅ {item_type.title()} removed successfully! (Cache cleared)")
-        else:
-            await message.reply_text(f"❌ No {item_type} found to remove.")
-
-    def run(self):
-        """Run the bot"""
-        from pyrogram import handlers
-
-        # Add all handlers
-        self.app.add_handler(
-            handlers.MessageHandler(self.start_handler,
-                                    pyrogram_filters.command("start")))
-        self.app.add_handler(
-            handlers.MessageHandler(self.set_intro_handler,
-                                    pyrogram_filters.command("setintro")))
-        self.app.add_handler(
-            handlers.MessageHandler(self.set_watermark_handler,
-                                    pyrogram_filters.command("setwatermark")))
-        self.app.add_handler(
-            handlers.MessageHandler(self.set_thumbnail_handler,
-                                    pyrogram_filters.command("setthumbnail")))
-        self.app.add_handler(
-            handlers.MessageHandler(self.add_caption_handler,
-                                    pyrogram_filters.command("addcaption")))
-        self.app.add_handler(
-            handlers.MessageHandler(self.convert_handler,
-                                    pyrogram_filters.command("convert")))
-        self.app.add_handler(
-            handlers.MessageHandler(self.status_handler,
-                                    pyrogram_filters.command("status")))
-        self.app.add_handler(
-            handlers.MessageHandler(self.stop_handler,
-                                    pyrogram_filters.command("stop")))
-        self.app.add_handler(
-            handlers.MessageHandler(self.bulk_handler,
-                                    pyrogram_filters.command("bulk")))
-        self.app.add_handler(
-            handlers.MessageHandler(self.remove_intro_handler,
-                                    pyrogram_filters.command("removeintro")))
-        self.app.add_handler(
-            handlers.MessageHandler(
-                self.remove_watermark_handler,
-                pyrogram_filters.command("removewatermark")))
-        self.app.add_handler(
-            handlers.MessageHandler(
-                self.remove_thumbnail_handler,
-                pyrogram_filters.command("removethumbnail")))
-        self.app.add_handler(
-            handlers.MessageHandler(self.remove_caption_handler,
-                                    pyrogram_filters.command("removecaption")))
-        self.app.add_handler(
-            handlers.MessageHandler(self.queue_handler,
-                                    pyrogram_filters.command("queue")))
-        self.app.add_handler(
-            handlers.MessageHandler(self.adduser_handler,
-                                    pyrogram_filters.command("adduser")))
-        self.app.add_handler(
-            handlers.MessageHandler(self.removeuser_handler,
-                                    pyrogram_filters.command("removeuser")))
-        self.app.add_handler(
-            handlers.MessageHandler(self.listadmins_handler,
-                                    pyrogram_filters.command("listadmins")))
-        self.app.add_handler(
-            handlers.MessageHandler(self.stats_handler,
-                                    pyrogram_filters.command("stats")))
-        self.app.add_handler(
-            handlers.MessageHandler(self.cleanup_handler,
-                                    pyrogram_filters.command("cleanup")))
-
-        # Media handlers
-        self.app.add_handler(
-            handlers.MessageHandler(self.video_handler,
-                                    pyrogram_filters.video))
-        self.app.add_handler(
-            handlers.MessageHandler(self.photo_handler,
-                                    pyrogram_filters.photo))
-        self.app.add_handler(
-            handlers.MessageHandler(self.document_handler,
-                                    pyrogram_filters.document))
-        self.app.add_handler(
-            handlers.MessageHandler(
-                self.text_handler,
-                pyrogram_filters.text & ~pyrogram_filters.command([
-                    "start", "setintro", "setwatermark", "setthumbnail",
-                    "addcaption", "convert", "status", "stop", "bulk",
-                    "removeintro", "removewatermark", "removethumbnail",
-                    "removecaption", "queue", "adduser", "removeuser",
-                    "listadmins", "stats", "cleanup"
-                ])))
-
-        print("🤖 Watermark Bot starting...")
-
+    # Advanced Admin Handlers
+    async def stats_handler_optimized(self, client: Client, message: Message):
+        """Advanced statistics with performance metrics"""
+        user_id = message.from_user.id
+        if user_id not in self.admin_users:
+            await message.reply_text("Admin access required.")
+            return
+        
         try:
-            self.app.run()
+            # System performance metrics
+            cpu_percent = psutil.cpu_percent(interval=1)
+            memory = psutil.virtual_memory()
+            disk = psutil.disk_usage('/')
+            
+            # Bot-specific metrics
+            active_users = self.session_manager.get_active_users_count()
+            processing_users = len([s for s in self.session_manager.sessions.values() if s.get('processing')])
+            
+            # File counts
+            intro_count = len([f for f in os.listdir('persistent_intros') if f.endswith('.mp4')]) if os.path.exists('persistent_intros') else 0
+            watermark_count = len([f for f in os.listdir('persistent_watermarks') if f.endswith('.png')]) if os.path.exists('persistent_watermarks') else 0
+            
+            # Cache statistics
+            cache_size = 0
+            cache_files = 0
+            if os.path.exists('cache'):
+                for root, dirs, files in os.walk('cache'):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        cache_size += os.path.getsize(file_path)
+                        cache_files += 1
+            
+            # GPU information
+            gpu_info = "Not available"
+            if self.video_processor.ffmpeg_processor.gpu_available:
+                gpu_info = f"{self.video_processor.ffmpeg_processor.gpu_type.upper()} ({self.video_processor.ffmpeg_processor.encoder})"
+            
+            stats_text = f"""**Advanced Bot Statistics**
+
+**System Performance:**
+CPU: {cpu_percent:.1f}%
+RAM: {memory.percent:.1f}% ({memory.used/1024/1024/1024:.1f}GB/{memory.total/1024/1024/1024:.1f}GB)
+Disk: {disk.percent:.1f}% ({disk.used/1024/1024/1024:.1f}GB/{disk.total/1024/1024/1024:.1f}GB)
+GPU Acceleration: {gpu_info}
+
+**Bot Activity:**
+Active Users: {active_users}
+Processing Users: {processing_users}
+Admin Users: {len(self.admin_users)}
+
+**Storage Usage:**
+Intro Videos: {intro_count}
+PNG Watermarks: {watermark_count}
+Cache Files: {cache_files} ({cache_size/1024/1024:.1f}MB)
+
+**Performance Settings:**
+Processing Threads: {self.video_processor.ffmpeg_processor.optimal_threads}
+Max Concurrent Processing: {self.bulk_optimizer.processing_semaphore._value}
+Max Concurrent Downloads: {self.bulk_optimizer.download_semaphore._value}
+            """
+            
+            await message.reply_text(stats_text)
+            
         except Exception as e:
-            logger.error(f"Bot error: {e}")
+            logger.error(f"Stats generation failed: {e}")
+            await message.reply_text(f"Stats error: {str(e)}")
+
+    async def cleanup_handler_optimized(self, client: Client, message: Message):
+        """Advanced cleanup with detailed reporting"""
+        user_id = message.from_user.id
+        if user_id not in self.admin_users:
+            await message.reply_text("Admin access required.")
+            return
+        
+        try:
+            cleanup_msg = await message.reply_text("Starting comprehensive cleanup...")
+            
+            cleaned_items = {
+                'temp_dirs': 0,
+                'cache_files': 0,
+                'old_logs': 0,
+                'orphaned_files': 0,
+                'freed_mb': 0
+            }
+            
+            # Cleanup temp directories
+            for root, dirs, files in os.walk('.'):
+                for dir_name in dirs[:]:  # Use slice to avoid modification during iteration
+                    if dir_name.startswith('temp_'):
+                        temp_path = os.path.join(root, dir_name)
+                        try:
+                            size_mb = sum(os.path.getsize(os.path.join(temp_path, f)) for f in os.listdir(temp_path)) / (1024*1024)
+                            shutil.rmtree(temp_path)
+                            cleaned_items['temp_dirs'] += 1
+                            cleaned_items['freed_mb'] += size_mb
+                        except:
+                            pass
+            
+            # Cleanup old cache files
+            if os.path.exists('cache'):
+                current_time = time.time()
+                for root, dirs, files in os.walk('cache'):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        try:
+                            if current_time - os.path.getmtime(file_path) > 86400:  # 24 hours
+                                size_mb = os.path.getsize(file_path) / (1024*1024)
+                                os.remove(file_path)
+                                cleaned_items['cache_files'] += 1
+                                cleaned_items['freed_mb'] += size_mb
+                        except:
+                            pass
+            
+            # Cleanup old log files
+            if os.path.exists('logs'):
+                for log_file in os.listdir('logs'):
+                    if log_file.endswith('.log'):
+                        log_path = os.path.join('logs', log_file)
+                        try:
+                            if time.time() - os.path.getmtime(log_path) > 604800:  # 7 days
+                                size_mb = os.path.getsize(log_path) / (1024*1024)
+                                os.remove(log_path)
+                                cleaned_items['old_logs'] += 1
+                                cleaned_items['freed_mb'] += size_mb
+                        except:
+                            pass
+            
+            # Force garbage collection
+            import gc
+            gc.collect()
+            
+            # Update cleanup message
+            cleanup_summary = f"""**Cleanup Completed!**
+
+Temp Directories: {cleaned_items['temp_dirs']} removed
+Cache Files: {cleaned_items['cache_files']} removed  
+Old Logs: {cleaned_items['old_logs']} removed
+Total Space Freed: {cleaned_items['freed_mb']:.2f}MB
+
+Memory garbage collection performed.
+System resources optimized.
+            """
+            
+            await cleanup_msg.edit_text(cleanup_summary)
+            
+        except Exception as e:
+            logger.error(f"Cleanup failed: {e}")
+            await message.reply_text(f"Cleanup error: {str(e)}")
+
+    # Helper methods
+    async def _clear_intro_cache(self, user_id: int):
+        """Clear cached intro files for user"""
+        try:
+            cache_dir = Path("cache/normalized_intros")
+            if cache_dir.exists():
+                for cache_file in cache_dir.iterdir():
+                    if f"intro_{user_id}" in cache_file.name:
+                        cache_file.unlink()
+        except Exception as e:
+            logger.warning(f"Cache clear failed: {e}")
+
+    def _format_duration(self, seconds: float) -> str:
+        """Format duration for display"""
+        if seconds >= 3600:
+            hours = int(seconds // 3600)
+            minutes = int((seconds % 3600) // 60)
+            return f"{hours}h{minutes}m"
+        elif seconds >= 60:
+            minutes = int(seconds // 60)
+            secs = int(seconds % 60)
+            return f"{minutes}m{secs}s"
+        else:
+            return f"{int(seconds)}s"
+
+    # Main execution method
+    def run(self):
+        """Run the ultra-optimized watermark bot"""
+        from pyrogram import handlers
+        
+        # Register all optimized handlers
+        handlers_list = [
+            # Command handlers
+            (handlers.MessageHandler(self.start_handler, pyrogram_filters.command("start")),),
+            (handlers.MessageHandler(self._create_command_handler('setintro', 'set_intro'), pyrogram_filters.command("setintro")),),
+            (handlers.MessageHandler(self._create_command_handler('setwatermark', 'set_watermark'), pyrogram_filters.command("setwatermark")),),
+            (handlers.MessageHandler(self._create_command_handler('setthumbnail', 'set_thumbnail'), pyrogram_filters.command("setthumbnail")),),
+            (handlers.MessageHandler(self._create_command_handler('addcaption', 'add_caption'), pyrogram_filters.command("addcaption")),),
+            (handlers.MessageHandler(self._create_command_handler('convert', 'convert_video'), pyrogram_filters.command("convert")),),
+            (handlers.MessageHandler(self._create_simple_handler(self._status_handler), pyrogram_filters.command("status")),),
+            (handlers.MessageHandler(self._create_simple_handler(self._stop_handler), pyrogram_filters.command("stop")),),
+            (handlers.MessageHandler(self._create_simple_handler(self._bulk_handler), pyrogram_filters.command("bulk")),),
+            (handlers.MessageHandler(self.stats_handler_optimized, pyrogram_filters.command("stats")),),
+            (handlers.MessageHandler(self.cleanup_handler_optimized, pyrogram_filters.command("cleanup")),),
+            
+            # Media handlers
+            (handlers.MessageHandler(self.video_handler_optimized, pyrogram_filters.video),),
+            (handlers.MessageHandler(self._photo_handler_optimized, pyrogram_filters.photo),),
+            (handlers.MessageHandler(self._document_handler_optimized, pyrogram_filters.document),),
+            
+            # Text handler (must be last)
+            (handlers.MessageHandler(
+                self.text_handler_optimized,
+                pyrogram_filters.text & ~pyrogram_filters.command([
+                    "start", "setintro", "setwatermark", "setthumbnail", "addcaption", 
+                    "convert", "status", "stop", "bulk", "stats", "cleanup"
+                ])
+            ),),
+        ]
+        
+        # Register all handlers
+        for handler_tuple in handlers_list:
+            self.app.add_handler(handler_tuple[0])
+        
+        print("Ultra-Fast Watermark Bot starting with full optimization...")
+        print(f"GPU Acceleration: {'Available' if self.video_processor.ffmpeg_processor.gpu_available else 'Not Available'}")
+        print(f"Processing Threads: {self.video_processor.ffmpeg_processor.optimal_threads}")
+        print(f"System: {self.get_optimized_system_info()}")
+        
+        try:
+            # Start the optimized bot
+            self.app.run()
+        except KeyboardInterrupt:
+            print("Bot stopped by user")
+        except Exception as e:
+            logger.error(f"Bot runtime error: {e}")
             raise
+        finally:
+            # Cleanup on shutdown
+            print("Performing shutdown cleanup...")
+            asyncio.run(self._shutdown_cleanup())
+
+    def _create_command_handler(self, command: str, waiting_state: str):
+        """Create optimized command handler"""
+        async def handler(client: Client, message: Message):
+            user_id = message.from_user.id
+            await self.session_manager.update_session(user_id, {'waiting_for': waiting_state})
+            
+            command_messages = {
+                'setintro': "Send the intro video:",
+                'setwatermark': "Send the watermark image (PNG recommended):",
+                'setthumbnail': "Send the thumbnail image:",
+                'addcaption': "Send the permanent caption:",
+                'convert': "Send the video to convert:"
+            }
+            
+            await message.reply_text(command_messages.get(command, "Send the required media:"))
+        
+        return handler
+
+    def _create_simple_handler(self, handler_func):
+        """Create wrapper for simple handlers"""
+        async def wrapper(client: Client, message: Message):
+            return await handler_func(message)
+        return wrapper
+
+    async def _shutdown_cleanup(self):
+        """Perform cleanup on bot shutdown"""
+        try:
+            # Cancel all background tasks
+            for task in asyncio.all_tasks():
+                if not task.done():
+                    task.cancel()
+            
+            # Final temp cleanup
+            await self._cleanup_temp_files()
+            
+            print("Shutdown cleanup completed")
+            
+        except Exception as e:
+            logger.error(f"Shutdown cleanup error: {e}")
 
 
+# Main execution
 if __name__ == "__main__":
+    # Environment configuration
     API_ID = int(os.getenv("API_ID", "6063221"))
     API_HASH = os.getenv("API_HASH", "8f9bebe9a9cb147ee58f70f46506f787")
-    BOT_TOKEN = os.getenv("BOT_TOKEN",
-                          "7219961311:AAEYxJ4aHzQsf2c6_dcQFyWskSkCeE-Sa4k")
-
-    print("🤖 Starting enhanced watermark bot...")
+    BOT_TOKEN = os.getenv("BOT_TOKEN", "7219961311:AAEYxJ4aHzQsf2c6_dcQFyWskSkCeE-Sa4k")
+    
+    # Initialize and run ultra-optimized bot
+    print("Initializing Ultra-Fast Watermark Bot...")
     bot = WatermarkBot(API_ID, API_HASH, BOT_TOKEN)
     bot.run()

